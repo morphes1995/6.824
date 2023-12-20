@@ -17,7 +17,11 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"math/rand"
+	"sync"
+	"time"
+)
 import "6.824/src/labrpc"
 
 // import "bytes"
@@ -41,8 +45,9 @@ type ApplyMsg struct {
 // LogEntry each entry contains command for state machine,
 // and term when entry was received by leader
 type LogEntry struct {
-	Term    int
-	Command interface{}
+	LogIndex int
+	Term     int
+	Command  interface{}
 }
 
 const (
@@ -74,6 +79,12 @@ type Raft struct {
 	commitIndex int /* index of the highest log entry known to be committed (initialized to 0, increases monotonically) */
 	lastApplied int /* index of the highest log entry applied to state machine (initialized to 0, increases monotonically)  */
 
+	// Channels between raft peers.
+	grantVoteC   chan bool
+	winElectionC chan bool
+	heartBeatC   chan bool
+
+	discoverHigherTermC chan bool
 }
 
 // GetState return currentTerm and whether this server
@@ -148,6 +159,40 @@ type RequestVoteReply struct {
 // RequestVote example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	DPrintf("%d receive vote request from %d\n", rf.me, args.CandidateId)
+
+	// reject candidate's vote request with stale term number
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
+	// if leader/candidate/follower discovers server with higher term, reset to follower
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = STATE_FOLLOWER
+		rf.voteCount = 0
+		rf.votedFor = -1
+	}
+
+	reply.Term = rf.currentTerm
+
+	reply.VoteGranted = false
+	// grant vote only if
+	// 1) votedFor is null or candidateId,
+	// 2) and candidate’s log is at least as up-to-date as receiver’s log
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.isUpToDate(args.Term) {
+		reply.VoteGranted = true
+
+		rf.votedFor = args.CandidateId
+		rf.grantVoteC <- true
+	}
+
+}
+
+func (rf *Raft) isUpToDate(term int) bool {
+	return term >= rf.currentTerm
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -178,8 +223,62 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	DPrintf("%d send vote request to %d\n", rf.me, server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	if !ok {
+		return ok
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// for cases
+	//  1) found newer term in RequestVoteReply, or in dealing of RequestVote ,
+	//     and already made this candidate reset to follower, discard this reply
+	//  2) previous reply already voted this candidate as leader, discard this reply
+	//  3) this reply consume a long transfer time , and this candidate's election timeout reached
+	//     and then became candidate again with currentTerm+1 , discard this reply
+	if rf.state != STATE_CANDIDATE || rf.currentTerm != args.Term {
+		return ok
+	}
+
+	// candidate discovers term newer than itself , reset to follower
+	if rf.currentTerm < reply.Term {
+		rf.currentTerm = reply.Term
+		rf.state = STATE_FOLLOWER
+		rf.voteCount = 0
+		rf.votedFor = -1
+
+		rf.discoverHigherTermC <- true
+		return ok
+	}
+
+	if reply.VoteGranted {
+		rf.voteCount++
+		// candidate has been received votes from the majority of servers
+		if rf.voteCount > len(rf.peers)/2 {
+			rf.state = STATE_LEADER
+			rf.winElectionC <- true
+			DPrintf("%d become leader\n", rf.me)
+		}
+	}
+
 	return ok
+}
+
+func (rf *Raft) broadcastRequestVote() {
+	DPrintf("%d broadcast request vote\n", rf.me)
+	args := &RequestVoteArgs{}
+	rf.mu.Lock()
+	args.Term = rf.currentTerm
+	args.CandidateId = rf.me
+	rf.mu.Unlock()
+
+	for i, _ := range rf.peers {
+		if (i != rf.me) && (rf.state == STATE_CANDIDATE /*  rf.state may already become follower because the discovery of higher term  */) {
+			go rf.sendRequestVote(i, args, &RequestVoteReply{})
+		}
+	}
 }
 
 type AppendEntriesArgs struct {
@@ -194,6 +293,82 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  /* currentTerm, for leader to update itself (if this leader is stale )*/
 	Success bool /* true if follower contained entry matching prevLogIndex and prevLogTerm */
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Success = false
+
+	// reject leader's heartbeat with stale term number
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	//  1) if leader/candidate/follower discovers server with higher term, reset to follower
+	//  2) if candidate receives a heartbeat from current term leader , then reset to follower
+	if args.Term > rf.currentTerm || (rf.state == STATE_CANDIDATE && args.Term == rf.currentTerm) {
+		rf.currentTerm = args.Term
+		rf.state = STATE_FOLLOWER
+		rf.voteCount = 0
+		rf.votedFor = -1
+	}
+
+	reply.Term = rf.currentTerm
+	reply.Success = true
+
+	rf.heartBeatC <- true
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	DPrintf("%d send append entries request to %d\n", rf.me, server)
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if !ok {
+		return ok
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// for cases
+	//  1) found newer term in AppendEntriesReply, or in dealing of RequestVote ,
+	//     and already reset this leader to follower, discard this reply
+	//  2) if leader reset to follower , and then election timeout, this leader become candidate, discard this reply
+	//  3) this reply consume a long transfer time ,if leader reset to follower, and then election timeout, this leader become candidate
+	//     , and then be voted to leader again with currentTerm+1 , discard this reply
+	if rf.state != STATE_LEADER || rf.currentTerm != args.Term {
+		return ok
+	}
+
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.state = STATE_FOLLOWER
+		rf.votedFor = -1
+		rf.voteCount = 0
+
+		rf.discoverHigherTermC <- true
+		DPrintf("%d leader find a newer term %d from %d", rf.currentTerm, reply.Term, server)
+	}
+
+	// todo deal with log
+
+	return ok
+}
+
+func (rf *Raft) broadcastAppendEntries() {
+	rf.mu.Lock()
+	args := &AppendEntriesArgs{}
+	args.Term = rf.currentTerm
+	args.LeaderId = rf.me
+	rf.mu.Unlock()
+
+	for i, _ := range rf.peers {
+		if i != rf.me && rf.state == STATE_LEADER /*  rf.state may already become follower because the discovery of higher term  */ {
+			go rf.sendAppendEntries(i, args, &AppendEntriesReply{})
+		}
+	}
 }
 
 // Start
@@ -227,6 +402,51 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
+func (rf *Raft) Run() {
+
+	for {
+		switch rf.state {
+		case STATE_FOLLOWER:
+			select {
+			// 1) receive any valid heartbeat from current leader or valid vote request
+			// 2) receive any valid vote request from candidate
+			// then reset election timeout in next loop
+			case <-rf.heartBeatC:
+			case <-rf.grantVoteC:
+			case <-time.After(time.Millisecond * time.Duration(rand.Intn(200)+300)): // not receive any valid heartbeat or valid vote request , election timeout!!
+				DPrintf("%d become candidate\n", rf.me)
+				rf.state = STATE_CANDIDATE
+			}
+
+		case STATE_LEADER:
+			go rf.broadcastAppendEntries()
+
+			select {
+			case <-rf.discoverHigherTermC: // find a newer term ,convert to follower
+			case <-time.After(time.Millisecond * 150): // heartbeat timeout
+
+			}
+
+		case STATE_CANDIDATE:
+			rf.mu.Lock()
+			rf.votedFor = rf.me
+			rf.currentTerm += 1
+			rf.voteCount = 1
+			rf.mu.Unlock()
+			go rf.broadcastRequestVote()
+
+			select {
+			case <-rf.discoverHigherTermC: // find a newer term ,convert to follower
+			case <-rf.heartBeatC: // receive appendEntries from a valid leader , become follower
+			case <-rf.winElectionC: // receive majority votes, become leader and broadcast append entries in next loop
+			case <-time.After(time.Millisecond * time.Duration(rand.Intn(200)+300)): // vote split, go to next election in next loop
+				DPrintf("%d candidate vote split ,vote: %d\n", rf.me, rf.voteCount)
+
+			}
+		}
+	}
+}
+
 // Make
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -250,15 +470,24 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.voteCount = 0
 
 	rf.currentTerm = 0
-	rf.logs = append(rf.logs, LogEntry{0, nil})
+	rf.logs = append(rf.logs, LogEntry{0, 0, nil})
 	rf.mu = sync.Mutex{}
 
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.votedFor = -1
 
+	// init as non-buffered chan
+	rf.grantVoteC = make(chan bool, 100)
+	rf.winElectionC = make(chan bool, 100)
+	rf.heartBeatC = make(chan bool, 100)
+
+	rf.discoverHigherTermC = make(chan bool, 100)
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	go rf.Run()
 
 	return rf
 }
