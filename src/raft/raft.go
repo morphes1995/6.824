@@ -209,7 +209,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 func (rf *Raft) isUpToDate(otherTerm int, otherIndex int) bool {
 	latestTerm, latestIndex := rf.getLastLogTerm(), rf.getLastLogIndex()
-	if otherTerm >= latestTerm || (otherTerm == latestIndex && otherIndex >= otherIndex) {
+	if otherTerm > latestTerm || (otherTerm == latestIndex && otherIndex >= otherIndex) {
 		return true
 	}
 	return false
@@ -539,7 +539,7 @@ func (rf *Raft) Run() {
 			// then reset election timeout in next loop
 			case <-rf.heartBeatC:
 			case <-rf.grantVoteC:
-			case <-time.After(time.Millisecond * time.Duration(rand.Intn(200)+300)): // not receive any valid heartbeat or valid vote request , election timeout!!
+			case <-time.After(time.Millisecond * time.Duration(rand.Intn(150)+200)): // not receive any valid heartbeat or valid vote request , election timeout!!
 				DPrintf("%d become candidate\n", rf.me)
 				rf.state = STATE_CANDIDATE
 			}
@@ -549,7 +549,7 @@ func (rf *Raft) Run() {
 
 			select {
 			case <-rf.discoverHigherTermC: // find a newer term ,convert to follower
-			case <-time.After(time.Millisecond * 150): // heartbeat timeout
+			case <-time.After(time.Millisecond * 100): // heartbeat timeout
 
 			}
 
@@ -565,7 +565,7 @@ func (rf *Raft) Run() {
 			case <-rf.discoverHigherTermC: // find a newer term ,convert to follower
 			case <-rf.heartBeatC: // receive appendEntries from a valid leader , become follower
 			case <-rf.winElectionC: // receive majority votes, become leader and broadcast append entries in next loop
-			case <-time.After(time.Millisecond * time.Duration(rand.Intn(200)+300)): // vote split, go to next election in next loop
+			case <-time.After(time.Millisecond * time.Duration(rand.Intn(150)+200)): // vote split, go to next election in next loop
 				DPrintf("%d candidate vote split ,vote: %d\n", rf.me, rf.voteCount)
 
 			}
