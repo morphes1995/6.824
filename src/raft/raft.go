@@ -79,12 +79,18 @@ type Raft struct {
 	commitIndex int /* index of the highest log entry known to be committed (initialized to 0, increases monotonically) */
 	lastApplied int /* index of the highest log entry applied to state machine (initialized to 0, increases monotonically)  */
 
+	// Volatile state on leader
+	nextIndex  []int /*  for each server, index of the next log entry to send to that server (initialized to leader last log index + 1) */
+	matchIndex []int /* known to be replicated on server (initialized to 0, increases monotonically) */
+
 	// Channels between raft peers.
 	grantVoteC   chan bool
 	winElectionC chan bool
 	heartBeatC   chan bool
 
 	discoverHigherTermC chan bool
+
+	applyC chan ApplyMsg
 }
 
 // GetState return currentTerm and whether this server
@@ -101,6 +107,14 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Unlock()
 
 	return term, isleader
+}
+
+func (rf *Raft) getLastLogIndex() int {
+	return len(rf.logs) - 1
+}
+
+func (rf *Raft) getLastLogTerm() int {
+	return rf.logs[len(rf.logs)-1].Term
 }
 
 // save Raft's persistent state to stable storage,
@@ -160,6 +174,8 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	DPrintf("%d receive vote request from %d\n", rf.me, args.CandidateId)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	// reject candidate's vote request with stale term number
 	if args.Term < rf.currentTerm {
@@ -182,7 +198,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// grant vote only if
 	// 1) votedFor is null or candidateId,
 	// 2) and candidate’s log is at least as up-to-date as receiver’s log
-	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.isUpToDate(args.Term) {
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.isUpToDate(args.LastLogTerm, args.LastLogIndex) {
 		reply.VoteGranted = true
 
 		rf.votedFor = args.CandidateId
@@ -191,8 +207,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 }
 
-func (rf *Raft) isUpToDate(term int) bool {
-	return term >= rf.currentTerm
+func (rf *Raft) isUpToDate(otherTerm int, otherIndex int) bool {
+	latestTerm, latestIndex := rf.getLastLogTerm(), rf.getLastLogIndex()
+	if otherTerm >= latestTerm || (otherTerm == latestIndex && otherIndex >= otherIndex) {
+		return true
+	}
+	return false
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -257,7 +277,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		rf.voteCount++
 		// candidate has been received votes from the majority of servers
 		if rf.voteCount > len(rf.peers)/2 {
-			rf.state = STATE_LEADER
+			rf.initNewLeaderSafe()
 			rf.winElectionC <- true
 			DPrintf("%d become leader\n", rf.me)
 		}
@@ -266,12 +286,24 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) initNewLeaderSafe() {
+	rf.state = STATE_LEADER
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	nextLogIdx := rf.getLastLogIndex() + 1
+	for i, _ := range rf.peers {
+		rf.nextIndex[i] = nextLogIdx // initialized to leader last log index + 1)
+	}
+}
+
 func (rf *Raft) broadcastRequestVote() {
 	DPrintf("%d broadcast request vote\n", rf.me)
 	args := &RequestVoteArgs{}
 	rf.mu.Lock()
 	args.Term = rf.currentTerm
 	args.CandidateId = rf.me
+	args.LastLogIndex = rf.getLastLogIndex()
+	args.LastLogTerm = rf.getLastLogTerm()
 	rf.mu.Unlock()
 
 	for i, _ := range rf.peers {
@@ -291,18 +323,20 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int  /* currentTerm, for leader to update itself (if this leader is stale )*/
-	Success bool /* true if follower contained entry matching prevLogIndex and prevLogTerm */
+	Term             int  /* currentTerm, for leader to update itself (if this leader is stale )*/
+	Success          bool /* true if follower contained entry matching prevLogIndex and prevLogTerm */
+	ExceptedLogIndex int  /* index of log entry that  follower excepted */
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	DPrintf("%d receive append entries request from %d ,args.PrevLogIndex %d,lastLogIndex: %d, commitIdx %d, \n",
+		rf.me, args.LeaderId, args.PrevLogIndex, rf.getLastLogIndex(), rf.commitIndex)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	reply.Success = false
-
 	// reject leader's heartbeat with stale term number
 	if args.Term < rf.currentTerm {
+		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
 	}
@@ -316,14 +350,50 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = -1
 	}
 
-	reply.Term = rf.currentTerm
-	reply.Success = true
-
 	rf.heartBeatC <- true
+
+	reply.Term = rf.currentTerm
+
+	if args.PrevLogIndex > rf.getLastLogIndex() {
+		// 1. logs[PrevLogIndex] in this follower didn't exist
+		reply.Success = false
+		reply.ExceptedLogIndex = rf.getLastLogIndex() + 1
+	} else if myPrevLogTerm := rf.logs[args.PrevLogIndex].Term; myPrevLogTerm != args.PrevLogTerm { // PrevLogIndex always > 0
+		// 2. logs[PrevLogIndex].term mismatch
+		reply.Success = false
+		reply.ExceptedLogIndex = args.PrevLogIndex //todo optimize ??
+	} else {
+		// 3. use leader's log entries to overwritten my corresponding part of log entries
+		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...) //todo optimize ??
+		reply.Success = true
+		reply.ExceptedLogIndex = args.PrevLogIndex + len(args.Entries) + 1
+	}
+
+	DPrintf("%d finish append entries request from %d ,ExceptedLogIndex: %d, success %v, \n",
+		rf.me, args.LeaderId, reply.ExceptedLogIndex, reply.Success)
+	if !reply.Success {
+		return
+	}
+	// if the logs caught up with leader , then sync commitIndex with leader
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = args.LeaderCommit // follower committed
+		go rf.applyLog()
+	}
+}
+
+func (rf *Raft) applyLog() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		rf.applyC <- ApplyMsg{CommandIndex: i, CommandValid: true, Command: rf.logs[i].Command}
+	}
+	rf.lastApplied = rf.commitIndex // follower applied
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	DPrintf("%d send append entries request to %d\n", rf.me, server)
+	DPrintf("%d send append entries request to %d, nextIdx %d, leaderCommitIdx: %d \n",
+		rf.me, server, args.PrevLogIndex+1, args.LeaderCommit)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
 		return ok
@@ -350,22 +420,62 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 		rf.discoverHigherTermC <- true
 		DPrintf("%d leader find a newer term %d from %d", rf.currentTerm, reply.Term, server)
+		return ok
 	}
 
-	// todo deal with log
+	rf.nextIndex[server] = reply.ExceptedLogIndex
+	if reply.Success {
+		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+	}
 
+	// forward commitIndex
+	// If there exists an i such that i > commitIndex, and a majority of
+	// matchIndex[peer] >= i, and log[N].term == currentTerm (only commit log entries of current term)
+	// set commitIndex = i
+	majority := len(rf.peers)/2 + 1
+	for i := rf.getLastLogIndex(); i > rf.commitIndex; i-- {
+		if rf.logs[i].Term < rf.currentTerm {
+			break // do not commit logs of other term
+		}
+		count := 0
+		for peer, _ := range rf.peers {
+			if rf.matchIndex[peer] >= i {
+				count++
+			}
+		}
+
+		if count >= majority {
+			rf.commitIndex = i
+			DPrintf("leader %d ,forward commitIndex to  %d, matchIndex: %v", rf.me, rf.commitIndex, rf.matchIndex)
+			go rf.applyLog()
+			break
+		}
+	}
+	DPrintf("leader %d , matchIndex: %v", rf.me, rf.matchIndex)
 	return ok
 }
 
 func (rf *Raft) broadcastAppendEntries() {
 	rf.mu.Lock()
-	args := &AppendEntriesArgs{}
-	args.Term = rf.currentTerm
-	args.LeaderId = rf.me
-	rf.mu.Unlock()
+	defer rf.mu.Unlock()
 
 	for i, _ := range rf.peers {
 		if i != rf.me && rf.state == STATE_LEADER /*  rf.state may already become follower because the discovery of higher term  */ {
+			args := &AppendEntriesArgs{}
+			args.Term = rf.currentTerm
+			args.LeaderId = rf.me
+			args.LeaderCommit = rf.commitIndex
+
+			args.PrevLogIndex = rf.nextIndex[i] - 1
+			if args.PrevLogIndex >= 0 {
+				args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
+			}
+
+			// entries need be sent to followers
+			if rf.nextIndex[i] <= rf.getLastLogIndex() {
+				args.Entries = rf.logs[rf.nextIndex[i]:]
+			}
+
 			go rf.sendAppendEntries(i, args, &AppendEntriesReply{})
 		}
 	}
@@ -385,11 +495,27 @@ func (rf *Raft) broadcastAppendEntries() {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	index := 0
+	term := 0
+	isLeader := rf.state == STATE_LEADER
+
+	if isLeader {
+		term = rf.currentTerm
+		index = rf.getLastLogIndex() + 1
+		rf.logs = append(rf.logs, LogEntry{
+			Term:     term,
+			LogIndex: index,
+			Command:  command,
+		})
+		rf.matchIndex[rf.me] = index
+		rf.nextIndex[rf.me] = index + 1
+		DPrintf("add log entry to leader %d ,current logs len : %d", rf.me, len(rf.logs))
+		// broadcastAppendEntries groutine will send to followers later
+	}
 
 	return index, term, isLeader
 }
@@ -460,22 +586,24 @@ func (rf *Raft) Run() {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
+	rf.mu = sync.Mutex{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyC = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 
 	rf.state = STATE_FOLLOWER
 	rf.voteCount = 0
+	rf.votedFor = -1
 
 	rf.currentTerm = 0
-	rf.logs = append(rf.logs, LogEntry{0, 0, nil})
-	rf.mu = sync.Mutex{}
 
+	// at least one log entry
+	rf.logs = append(rf.logs, LogEntry{0, 0, nil})
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-	rf.votedFor = -1
 
 	// init as non-buffered chan
 	rf.grantVoteC = make(chan bool, 100)
