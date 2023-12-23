@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.824/src/labgob"
+	"bytes"
 	"math/rand"
 	"sync"
 	"time"
@@ -122,13 +124,15 @@ func (rf *Raft) getLastLogTerm() int {
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -137,18 +141,21 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var logs []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+
+		DPrintf("error while decode data")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.logs = logs
+	}
 }
 
 // RequestVoteArgs example RequestVote RPC arguments structure.
@@ -205,6 +212,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.grantVoteC <- true
 	}
 
+	// state has changed
+	rf.persist()
 }
 
 func (rf *Raft) isUpToDate(otherTerm int, otherIndex int) bool {
@@ -268,7 +277,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		rf.state = STATE_FOLLOWER
 		rf.voteCount = 0
 		rf.votedFor = -1
-
+		// state has changed
+		rf.persist()
 		rf.discoverHigherTermC <- true
 		return ok
 	}
@@ -348,6 +358,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.state = STATE_FOLLOWER
 		rf.voteCount = 0
 		rf.votedFor = -1
+
+		// state has changed
+		rf.persist()
 	}
 
 	rf.heartBeatC <- true
@@ -367,6 +380,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...) //todo optimize ??
 		reply.Success = true
 		reply.ExceptedLogIndex = args.PrevLogIndex + len(args.Entries) + 1
+
+		// state has changed
+		rf.persist()
 	}
 
 	DPrintf("%d finish append entries request from %d ,ExceptedLogIndex: %d, success %v, \n",
@@ -417,6 +433,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		rf.state = STATE_FOLLOWER
 		rf.votedFor = -1
 		rf.voteCount = 0
+
+		// state has changed
+		rf.persist()
 
 		rf.discoverHigherTermC <- true
 		DPrintf("%d leader find a newer term %d from %d", rf.currentTerm, reply.Term, server)
@@ -511,6 +530,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			LogIndex: index,
 			Command:  command,
 		})
+		// state has changed
+		rf.persist()
+
 		rf.matchIndex[rf.me] = index
 		rf.nextIndex[rf.me] = index + 1
 		DPrintf("add log entry to leader %d ,current logs len : %d", rf.me, len(rf.logs))
@@ -558,6 +580,10 @@ func (rf *Raft) Run() {
 			rf.votedFor = rf.me
 			rf.currentTerm += 1
 			rf.voteCount = 1
+
+			// state has changed
+			rf.persist()
+
 			rf.mu.Unlock()
 			go rf.broadcastRequestVote()
 
@@ -596,12 +622,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.state = STATE_FOLLOWER
 	rf.voteCount = 0
-	rf.votedFor = -1
 
-	rf.currentTerm = 0
+	prevState := persister.ReadRaftState()
+	if prevState == nil || len(prevState) < 1 {
+		// first bootstrap
+		rf.votedFor = -1
+		rf.currentTerm = 0
+		// at least one log entry
+		rf.logs = append(rf.logs, LogEntry{0, 0, nil})
+		rf.persist()
+	} else {
+		// initialize from state persisted before a crash
+		rf.readPersist(prevState)
+	}
 
-	// at least one log entry
-	rf.logs = append(rf.logs, LogEntry{0, 0, nil})
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
@@ -611,9 +645,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartBeatC = make(chan bool, 100)
 
 	rf.discoverHigherTermC = make(chan bool, 100)
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	go rf.Run()
 
