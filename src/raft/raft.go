@@ -73,9 +73,9 @@ type Raft struct {
 	voteCount int
 
 	// Persistent state on all servers:
-	currentTerm int /* latest term server has seen (initialized to 0 on first boot, increases monotonically)*/
-	votedFor    int /* candidateId that received vote in current term (-1 if none) */
-	logs        []LogEntry
+	currentTerm int        /* latest term server has seen (initialized to 0 on first boot, increases monotonically)*/
+	votedFor    int        /* candidateId that received vote in current term (-1 if none) */
+	logs        []LogEntry // todo adapt for periodically discard old log entries, when access rf.logs using index corresponding to  base log index
 
 	// Volatile state on all servers.
 	commitIndex int /* index of the highest log entry known to be committed (initialized to 0, increases monotonically) */
@@ -342,8 +342,8 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	DPrintf("%d receive append entries request from %d ,args.PrevLogIndex %d,lastLogIndex: %d, commitIdx %d, \n",
-		rf.me, args.LeaderId, args.PrevLogIndex, rf.getLastLogIndex(), rf.commitIndex)
+	DPrintf("%d receive append entries request from %d , args.term %d ,currentTerm %d| args.PrevLogIndex %d, args.PrevLogTerm %d, lastLogIndex: %d, lastLogTerm %d, \n",
+		rf.me, args.LeaderId, args.Term, rf.currentTerm, args.PrevLogIndex, args.PrevLogTerm, rf.getLastLogIndex(), rf.getLastLogTerm())
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -376,11 +376,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.ExceptedLogIndex = rf.getLastLogIndex() + 1
 	} else if myPrevLogTerm := rf.logs[args.PrevLogIndex].Term; myPrevLogTerm != args.PrevLogTerm { // PrevLogIndex always > 0
 		// 2. logs[PrevLogIndex].term mismatch
+
+		// simple implementation
+		//reply.Success = false
+		//reply.ExceptedLogIndex = args.PrevLogIndex
+
+		// optimization
+		// allow a follower to backward the leader's nextIndex by one term at a time, instead one log entry at a time
+		// because of the net packages loss and miss-order,  if follower indicate the leader to minus down nextIndex one by one, this will be consuming much time
+		lastIndexOfPrevTerm := args.PrevLogIndex - 1
+		for ; lastIndexOfPrevTerm >= 0 && rf.logs[lastIndexOfPrevTerm].Term == myPrevLogTerm; lastIndexOfPrevTerm-- {
+			/* locate the last log entry in the Term which is in front of `myPrevLogTerm`*/
+		}
 		reply.Success = false
-		reply.ExceptedLogIndex = args.PrevLogIndex //todo optimize ??
+		reply.ExceptedLogIndex = lastIndexOfPrevTerm + 1
+
 	} else {
 		// 3. use leader's log entries to overwritten my corresponding part of log entries
-		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...) //todo optimize ??
+		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
 		reply.Success = true
 		reply.ExceptedLogIndex = args.PrevLogIndex + len(args.Entries) + 1
 
@@ -444,7 +457,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		DPrintf("%d leader find a newer term %d from %d", rf.currentTerm, reply.Term, server)
 		return ok
 	}
-
+	DPrintf("leader %d deal with vote request response, update nextIndex[%d]= %d", rf.me, server, reply.ExceptedLogIndex)
 	rf.nextIndex[server] = reply.ExceptedLogIndex
 	if reply.Success {
 		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
@@ -473,7 +486,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			break
 		}
 	}
-	DPrintf("leader %d , matchIndex: %v", rf.me, rf.matchIndex)
+	DPrintf("leader %d , matchIndex: %v nextIndex %v", rf.me, rf.matchIndex, rf.nextIndex)
 	return ok
 }
 
