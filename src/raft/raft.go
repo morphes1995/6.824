@@ -181,7 +181,8 @@ type RequestVoteReply struct {
 // RequestVote example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	DPrintf("%d receive vote request from %d\n", rf.me, args.CandidateId)
+	DPrintf("%d receive vote request from %d  args.term %d , currTerm %d , votedFor %d, | arg.lastLogTerm %d arg.lastLogIdx %d  lastLogTerm %d  lastLogIdx %d\n",
+		rf.me, args.CandidateId, args.Term, rf.currentTerm, rf.votedFor, args.LastLogTerm, args.LastLogIndex, rf.getLastLogTerm(), rf.getLastLogIndex())
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -210,6 +211,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 
 		rf.votedFor = args.CandidateId
+		DPrintf("%d grant vote to %d", rf.me, args.CandidateId)
 		rf.grantVoteC <- true
 	}
 
@@ -217,9 +219,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.persist()
 }
 
-func (rf *Raft) isUpToDate(otherTerm int, otherIndex int) bool {
-	latestTerm, latestIndex := rf.getLastLogTerm(), rf.getLastLogIndex()
-	if otherTerm > latestTerm || (otherTerm == latestIndex && otherIndex >= otherIndex) {
+func (rf *Raft) isUpToDate(candidateLogTerm int, candidateLogIndex int) bool {
+	myLogTerm, myLogtIndex := rf.getLastLogTerm(), rf.getLastLogIndex()
+	if candidateLogTerm > myLogTerm || (candidateLogTerm == myLogTerm && candidateLogIndex >= myLogtIndex) {
 		return true
 	}
 	return false
@@ -308,7 +310,7 @@ func (rf *Raft) initNewLeaderSafe() {
 }
 
 func (rf *Raft) broadcastRequestVote() {
-	DPrintf("%d broadcast request vote\n", rf.me)
+	DPrintf("%d broadcast request vote, term %d last index %d\n", rf.me, rf.currentTerm, rf.getLastLogIndex())
 	args := &RequestVoteArgs{}
 	rf.mu.Lock()
 	args.Term = rf.currentTerm
