@@ -91,6 +91,7 @@ type Raft struct {
 	heartBeatC   chan bool
 
 	discoverHigherTermC chan bool
+	killC               chan bool
 
 	applyC chan ApplyMsg
 }
@@ -542,17 +543,25 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
-// the tester calls Kill() when a Raft instance won't
+// Kill the tester calls Kill() when a Raft instance won't
 // be needed again. you are not required to do anything
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	rf.killC <- true
 }
 
 func (rf *Raft) Run() {
-
 	for {
+
+		select {
+		case <-rf.killC:
+			DPrintf("%d raft main loop exited , %p", rf.me, rf)
+			return
+		default:
+		}
+
 		switch rf.state {
 		case STATE_FOLLOWER:
 			select {
@@ -562,8 +571,10 @@ func (rf *Raft) Run() {
 			case <-rf.heartBeatC:
 			case <-rf.grantVoteC:
 			case <-time.After(time.Millisecond * time.Duration(rand.Intn(150)+200)): // not receive any valid heartbeat or valid vote request , election timeout!!
-				DPrintf("%d become candidate\n", rf.me)
+				DPrintf("%d become candidate, %p\n", rf.me, rf)
+				rf.mu.Lock()
 				rf.state = STATE_CANDIDATE
+				rf.mu.Unlock()
 			}
 
 		case STATE_LEADER:
@@ -572,7 +583,6 @@ func (rf *Raft) Run() {
 			select {
 			case <-rf.discoverHigherTermC: // find a newer term ,convert to follower
 			case <-time.After(time.Millisecond * 100): // heartbeat timeout
-
 			}
 
 		case STATE_CANDIDATE:
@@ -593,7 +603,6 @@ func (rf *Raft) Run() {
 			case <-rf.winElectionC: // receive majority votes, become leader and broadcast append entries in next loop
 			case <-time.After(time.Millisecond * time.Duration(rand.Intn(150)+200)): // vote split, go to next election in next loop
 				DPrintf("%d candidate vote split ,vote: %d\n", rf.me, rf.voteCount)
-
 			}
 		}
 	}
@@ -612,6 +621,7 @@ func (rf *Raft) Run() {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
+	DPrintf("make raft instance %d %p", me, rf)
 	rf.mu = sync.Mutex{}
 	rf.peers = peers
 	rf.persister = persister
@@ -634,6 +644,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	} else {
 		// initialize from state persisted before a crash
 		rf.readPersist(prevState)
+		DPrintf("%d read from persister, %p", rf.me, rf)
 	}
 
 	rf.commitIndex = 0
@@ -645,6 +656,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartBeatC = make(chan bool, 100)
 
 	rf.discoverHigherTermC = make(chan bool, 100)
+	rf.killC = make(chan bool)
 
 	go rf.Run()
 
