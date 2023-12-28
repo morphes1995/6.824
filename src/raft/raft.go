@@ -125,11 +125,16 @@ func (rf *Raft) getLastLogTerm() int {
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
 	// Your code here (2C).
+	// todo optimization
+	// using batch method to persist state before communicate with other nodes (once this node communicate with others ,eg send reply,
+	// which means that the modification made on this node was already persisted )
+	// instead of persist every time when the state change
+
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
 	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
+	e.Encode(rf.votedFor) // to prevent this node from voting twice in one term,  thus forbid the case that two leader in one term
 	e.Encode(rf.logs)
 
 	data := w.Bytes()
@@ -205,7 +210,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.VoteGranted = false
 	// grant vote only if
-	// 1) votedFor is null or candidateId,
+	// 1) this node do not vote in rf.currentTerm, or this node already voted to args.Candidate in rf.currentTerm
+	//   (one node only have one ticket in a spec term, if this node in rf.currentTerm already voted, it can't vote to this candidate )
 	// 2) and candidate’s log is at least as up-to-date as receiver’s log
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.isUpToDate(args.LastLogTerm, args.LastLogIndex) {
 		reply.VoteGranted = true
@@ -381,7 +387,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//reply.Success = false
 		//reply.ExceptedLogIndex = args.PrevLogIndex
 
-		// optimization
+		// optimization  todo may be can optimize further
 		// allow a follower to backward the leader's nextIndex by one term at a time, instead one log entry at a time
 		// because of the net packages loss and miss-order,  if follower indicate the leader to minus down nextIndex one by one, this will be consuming much time
 		lastIndexOfPrevTerm := args.PrevLogIndex - 1
@@ -389,7 +395,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			/* locate the last log entry in the Term which is in front of `myPrevLogTerm`*/
 		}
 		reply.Success = false
-		reply.ExceptedLogIndex = lastIndexOfPrevTerm + 1
+		reply.ExceptedLogIndex = lastIndexOfPrevTerm + 1 // first entry index of myPrevLogTerm
 
 	} else {
 		// 3. use leader's log entries to overwritten my corresponding part of log entries
@@ -407,6 +413,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	// if the logs caught up with leader , then sync commitIndex with leader
+	// this means that , if a server reboot from crash , it's commitIndex is 0, and the state machine is empty.
+	// Only when this server's logs was synced to leader's successfully (AppendEntriesReply.Success is true),
+	// this server will apply logs[: LeaderCommit+1] to it's state machine
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = args.LeaderCommit // follower committed
 		go rf.applyLog()
