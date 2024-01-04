@@ -1,13 +1,19 @@
 package raftkv
 
-import "labrpc"
+import (
+	"6.824/src/labrpc"
+	"sync"
+)
 import "crypto/rand"
 import "math/big"
-
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	mu            sync.Mutex
+	clientId      int64
+	requestId     int
+	currentLeader int
 }
 
 func nrand() int64 {
@@ -21,11 +27,14 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientId = nrand()
+	ck.requestId = 0
+	ck.mu = sync.Mutex{}
+	ck.currentLeader = 0
 	return ck
 }
 
-//
-// fetch the current value for a key.
+// Get fetch the current value for a key.
 // returns "" if the key does not exist.
 // keeps trying forever in the face of all other errors.
 //
@@ -35,14 +44,31 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) Get(key string) string {
-
 	// You will have to modify this function.
-	return ""
+	args := GetArgs{
+		Key:      key,
+		ClientId: ck.clientId,
+	}
+
+	ck.mu.Lock()
+	args.RequestId = ck.requestId
+	ck.requestId++
+	ck.mu.Unlock()
+
+	for {
+		server := ck.servers[ck.currentLeader]
+		reply := GetReply{}
+		ok := server.Call("KVServer.Get", &args, &reply)
+		if ok && !reply.WrongLeader {
+			return reply.Value
+		}
+
+		ck.currentLeader = (ck.currentLeader + 1) % len(ck.servers) // choose another possible raft leader
+	}
 }
 
-//
+// PutAppend
 // shared by Put and Append.
 //
 // you can send an RPC with code like this:
@@ -51,14 +77,35 @@ func (ck *Clerk) Get(key string) string {
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		ClientId: ck.clientId,
+	}
+
+	ck.mu.Lock()
+	args.RequestId = ck.requestId
+	ck.requestId++
+	ck.mu.Unlock()
+
+	for {
+		server := ck.servers[ck.currentLeader]
+		reply := PutAppendReply{}
+		ok := server.Call("KVServer.PutAppend", &args, &reply)
+		if ok && !reply.WrongLeader {
+			return
+		}
+
+		ck.currentLeader = (ck.currentLeader + 1) % len(ck.servers) // choose another possible raft leader
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.PutAppend(key, value, PUT)
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.PutAppend(key, value, APPEND)
 }
