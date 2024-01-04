@@ -71,7 +71,6 @@ func (kv *KVServer) Run() {
 			kv.mu.Unlock()
 
 		case <-kv.stopCh:
-			DPrintf("KVServer %d exit", kv.me)
 			return
 
 		}
@@ -93,11 +92,12 @@ func (kv *KVServer) applyEntry(entry Op) {
 func (kv *KVServer) appendLogEntry(entry Op) bool {
 	kv.mu.Lock()
 	requestId, ok := kv.ack[entry.ClientId]
-	kv.mu.Unlock()
 	if ok && requestId >= entry.RequestId { // ignore requests that already processed
+		kv.mu.Unlock()
 		DPrintf("request %d already processed", entry.RequestId)
 		return true
 	}
+	kv.mu.Unlock()
 
 	index, _, isLeader := kv.rf.Start(entry)
 	if !isLeader {
