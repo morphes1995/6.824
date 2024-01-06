@@ -113,14 +113,20 @@ func (kv *KVServer) appendLogEntry(entry Op) bool {
 	kv.mu.Unlock()
 
 	// wait for raft to commit and apply this op
+	result := false
 	select {
 	case entryApplied := <-ch:
 		// logs[index] may be changed and is not equal to `entry` , because the leadership change
 		// and old leader's log entry was overwritten by new leader's
-		return entryApplied == entry
-	case <-time.After(800 * time.Millisecond):
-		return false
+		result = entryApplied == entry
+	case <-time.After(300 * time.Millisecond):
 	}
+
+	kv.mu.Lock()
+	delete(kv.pendingRequests, index) // remove stale chan
+	kv.mu.Unlock()
+
+	return result
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
