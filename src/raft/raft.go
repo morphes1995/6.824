@@ -381,11 +381,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.currentTerm
 	baseIndex := rf.logs[0].LogIndex
-	if args.PrevLogIndex > rf.getLastLogIndex() {
+
+	DPrintf("%d deal append entries request from %d ,rgs.PrevLogIndex: %d, baseIndex %d, \n",
+		rf.me, args.LeaderId, args.PrevLogIndex, baseIndex)
+	// in normal case, PrevLogIndex always >= baseIndex , but in unreliable network, PrevLogIndex may less than baseIndex
+	if args.PrevLogIndex > rf.getLastLogIndex() || args.PrevLogIndex < baseIndex {
 		// 1. logs[PrevLogIndex] in this follower didn't exist
 		reply.Success = false
 		reply.ExceptedLogIndex = rf.getLastLogIndex() + 1
-	} else if myPrevLogTerm := rf.logs[args.PrevLogIndex-baseIndex].Term; myPrevLogTerm != args.PrevLogTerm { // PrevLogIndex always >= baseIndex
+	} else if myPrevLogTerm := rf.logs[args.PrevLogIndex-baseIndex].Term; myPrevLogTerm != args.PrevLogTerm {
 		// 2. logs[PrevLogIndex-baseIndex].term mismatch
 
 		// simple implementation
@@ -396,7 +400,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// allow a follower to backward the leader's nextIndex by one term at a time, instead one log entry at a time
 		// because of the net packages loss and miss-order,  if follower indicate the leader to minus down nextIndex one by one, this will be consuming much time
 		lastIndexOfPrevTerm := args.PrevLogIndex - 1
-		for ; lastIndexOfPrevTerm >= baseIndex && rf.logs[lastIndexOfPrevTerm-baseIndex].Term == myPrevLogTerm; lastIndexOfPrevTerm-- {
+		for ; lastIndexOfPrevTerm > baseIndex && rf.logs[lastIndexOfPrevTerm-baseIndex].Term == myPrevLogTerm; lastIndexOfPrevTerm-- {
 			/* locate the last log entry in the Term which is in front of `myPrevLogTerm`*/
 		}
 		reply.Success = false
@@ -431,6 +435,8 @@ func (rf *Raft) applyLog() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	baseIndex := rf.logs[0].LogIndex
+	DPrintf("%d apply log , rf.lastApplied %d, rf.commitIndex %d, baseIndex:%d",
+		rf.me, rf.lastApplied, rf.commitIndex, baseIndex)
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		rf.applyC <- ApplyMsg{CommandIndex: i, CommandValid: true, Command: rf.logs[i-baseIndex].Command}
 	}
@@ -704,7 +710,7 @@ func (rf *Raft) Run() {
 			// then reset election timeout in next loop
 			case <-rf.heartBeatC:
 			case <-rf.grantVoteC:
-			case <-time.After(time.Millisecond * time.Duration(rand.Intn(150)+200)): // not receive any valid heartbeat or valid vote request , election timeout!!
+			case <-time.After(time.Millisecond * time.Duration(rand.Intn(200)+150)): // not receive any valid heartbeat or valid vote request , election timeout!!
 				DPrintf("%d become candidate, %p\n", rf.me, rf)
 				rf.mu.Lock()
 				rf.state = STATE_CANDIDATE
@@ -735,7 +741,7 @@ func (rf *Raft) Run() {
 			case <-rf.discoverHigherTermC: // find a newer term ,convert to follower
 			case <-rf.heartBeatC: // receive appendEntries from a valid leader , become follower
 			case <-rf.winElectionC: // receive majority votes, become leader and broadcast append entries in next loop
-			case <-time.After(time.Millisecond * time.Duration(rand.Intn(150)+200)): // vote split, go to next election in next loop
+			case <-time.After(time.Millisecond * time.Duration(rand.Intn(200)+150)): // vote split, go to next election in next loop
 				DPrintf("%d candidate vote split ,vote: %d\n", rf.me, rf.voteCount)
 			}
 		}
@@ -828,6 +834,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = STATE_FOLLOWER
 	rf.voteCount = 0
 
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	// init as non-buffered chan
+	rf.grantVoteC = make(chan bool, 100)
+	rf.winElectionC = make(chan bool, 100)
+	rf.heartBeatC = make(chan bool, 100)
+
+	rf.discoverHigherTermC = make(chan bool, 100)
+	rf.killC = make(chan bool)
+
 	rf.recoverFromSnapshot(persister.ReadSnapshot())
 
 	prevState := persister.ReadRaftState()
@@ -843,17 +860,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.readPersist(prevState)
 		DPrintf("%d read from persister, %p", rf.me, rf)
 	}
-
-	rf.commitIndex = 0
-	rf.lastApplied = 0
-
-	// init as non-buffered chan
-	rf.grantVoteC = make(chan bool, 100)
-	rf.winElectionC = make(chan bool, 100)
-	rf.heartBeatC = make(chan bool, 100)
-
-	rf.discoverHigherTermC = make(chan bool, 100)
-	rf.killC = make(chan bool)
 
 	go rf.Run()
 
