@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -56,13 +56,12 @@ func (kv *KVServer) Run() {
 		select {
 		// 0. receive applied log entry from raft
 		case msg := <-kv.applyCh:
-			entry := msg.Command.(Op)
 			kv.mu.Lock()
-
 			if msg.IsSnapshot {
 				// 1. apply snapshot
 				kv.applySnapshot(msg.Snapshot)
 			} else {
+				entry := msg.Command.(Op)
 				requestId, ok := kv.ack[entry.ClientId]
 				if !ok || requestId < entry.RequestId {
 					// 2.1. apply state to kv server
@@ -235,7 +234,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 100)
 	kv.stopCh = make(chan any, 1)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
