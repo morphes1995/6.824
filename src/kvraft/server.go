@@ -4,6 +4,7 @@ import (
 	"6.824/src/labgob"
 	"6.824/src/labrpc"
 	"6.824/src/raft"
+	"bytes"
 	"log"
 	"sync"
 	"time"
@@ -47,27 +48,44 @@ type KVServer struct {
 	// Your definitions here.
 	data            map[string]string
 	ack             map[int64]int
-	pendingRequests map[int]chan Op // todo each op has a chan, wasteful !!
+	pendingRequests map[int]chan Op
 }
 
 func (kv *KVServer) Run() {
 	for {
 		select {
+		// 0. receive applied log entry from raft
 		case msg := <-kv.applyCh:
 			entry := msg.Command.(Op)
-
 			kv.mu.Lock()
-			requestId, ok := kv.ack[entry.ClientId]
-			if !ok || requestId < entry.RequestId {
-				kv.applyEntry(entry)
-				kv.ack[entry.ClientId] = entry.RequestId
-			}
 
-			ch, ok := kv.pendingRequests[msg.CommandIndex]
-			if ok {
-				ch <- entry
-			}
+			if msg.IsSnapshot {
+				// 1. apply snapshot
+				kv.applySnapshot(msg.Snapshot)
+			} else {
+				requestId, ok := kv.ack[entry.ClientId]
+				if !ok || requestId < entry.RequestId {
+					// 2.1. apply state to kv server
+					kv.applyEntry(entry)
+					kv.ack[entry.ClientId] = entry.RequestId
+				}
 
+				// 2.2. notify pending operation
+				ch, ok := kv.pendingRequests[msg.CommandIndex]
+				if ok {
+					ch <- entry
+				}
+
+				// 2.3. create snapshot if raft state exceeds allowed size
+				if kv.maxraftstate != -1 && kv.rf.GetStateSize() >= kv.maxraftstate {
+					w := new(bytes.Buffer)
+					e := labgob.NewEncoder(w)
+
+					e.Encode(kv.data)
+					e.Encode(kv.ack)
+					go kv.rf.CreateSnapShot(w.Bytes(), msg.CommandIndex)
+				}
+			}
 			kv.mu.Unlock()
 
 		case <-kv.stopCh:
@@ -87,6 +105,17 @@ func (kv *KVServer) applyEntry(entry Op) {
 
 	}
 
+}
+
+func (kv *KVServer) applySnapshot(snapshot []byte) {
+	var lastIncludedIndex, lastIncludedTerm int
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	d.Decode(&lastIncludedIndex)
+	d.Decode(&lastIncludedTerm)
+	d.Decode(&kv.data)
+	d.Decode(&kv.ack)
 }
 
 func (kv *KVServer) appendLogEntry(entry Op) bool {
