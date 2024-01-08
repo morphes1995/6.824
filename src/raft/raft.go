@@ -823,7 +823,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	DPrintf("make raft instance %d %p", me, rf)
-	rf.mu = sync.Mutex{}
+	//rf.mu = sync.Mutex{} //  zero-value-is-useful property
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me

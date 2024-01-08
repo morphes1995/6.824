@@ -29,7 +29,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	// You'll have to add code here.
 	ck.clientId = nrand()
 	ck.requestId = 0
-	ck.mu = sync.Mutex{}
+	//ck.mu = sync.Mutex{}  //  zero-value-is-useful property
 	ck.currentLeader = 0
 	return ck
 }
