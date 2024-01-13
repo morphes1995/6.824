@@ -191,10 +191,10 @@ type RequestVoteReply struct {
 // RequestVote example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	DPrintf("%d receive vote request from %d  args.term %d , currTerm %d , votedFor %d, | arg.lastLogTerm %d arg.lastLogIdx %d  lastLogTerm %d  lastLogIdx %d\n",
-		rf.me, args.CandidateId, args.Term, rf.currentTerm, rf.votedFor, args.LastLogTerm, args.LastLogIndex, rf.getLastLogTerm(), rf.getLastLogIndex())
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	DPrintf("%d receive vote request from %d  args.term %d , currTerm %d , votedFor %d, | arg.lastLogTerm %d arg.lastLogIdx %d  lastLogTerm %d  lastLogIdx %d\n",
+		rf.me, args.CandidateId, args.Term, rf.currentTerm, rf.votedFor, args.LastLogTerm, args.LastLogIndex, rf.getLastLogTerm(), rf.getLastLogIndex())
 
 	// reject candidate's vote request with stale term number
 	if args.Term < rf.currentTerm {
@@ -321,14 +321,14 @@ func (rf *Raft) initNewLeaderSafe() {
 }
 
 func (rf *Raft) broadcastRequestVote() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	DPrintf("%d broadcast request vote, term %d last index %d\n", rf.me, rf.currentTerm, rf.getLastLogIndex())
 	args := &RequestVoteArgs{}
-	rf.mu.Lock()
 	args.Term = rf.currentTerm
 	args.CandidateId = rf.me
 	args.LastLogIndex = rf.getLastLogIndex()
 	args.LastLogTerm = rf.getLastLogTerm()
-	rf.mu.Unlock()
 
 	for i, _ := range rf.peers {
 		if (i != rf.me) && (rf.state == STATE_CANDIDATE /*  rf.state may already become follower because the discovery of higher term  */) {
@@ -353,10 +353,11 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	DPrintf("%d receive append entries request from %d , args.term %d ,currentTerm %d| args.PrevLogIndex %d, args.PrevLogTerm %d, lastLogIndex: %d, lastLogTerm %d, \n",
-		rf.me, args.LeaderId, args.Term, rf.currentTerm, args.PrevLogIndex, args.PrevLogTerm, rf.getLastLogIndex(), rf.getLastLogTerm())
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	DPrintf("%d receive append entries request from %d , args.term %d ,currentTerm %d| args.PrevLogIndex %d, args.PrevLogTerm %d, lastLogIndex: %d, lastLogTerm %d, \n",
+		rf.me, args.LeaderId, args.Term, rf.currentTerm, args.PrevLogIndex, args.PrevLogTerm, rf.getLastLogIndex(), rf.getLastLogTerm())
 
 	// reject leader's heartbeat with stale term number
 	if args.Term < rf.currentTerm {
@@ -702,7 +703,10 @@ func (rf *Raft) Run() {
 		default:
 		}
 
-		switch rf.state {
+		rf.mu.Lock()
+		state := rf.state
+		rf.mu.Unlock()
+		switch state {
 		case STATE_FOLLOWER:
 			select {
 			// 1) receive any valid heartbeat from current leader or valid vote request
@@ -742,7 +746,9 @@ func (rf *Raft) Run() {
 			case <-rf.heartBeatC: // receive appendEntries from a valid leader , become follower
 			case <-rf.winElectionC: // receive majority votes, become leader and broadcast append entries in next loop
 			case <-time.After(time.Millisecond * time.Duration(rand.Intn(200)+150)): // vote split, go to next election in next loop
+				rf.mu.Lock()
 				DPrintf("%d candidate vote split ,vote: %d\n", rf.me, rf.voteCount)
+				rf.mu.Unlock()
 			}
 		}
 	}
