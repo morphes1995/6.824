@@ -1,13 +1,10 @@
 package shardkv
 
-
 // import "shardmaster"
-import "labrpc"
-import "raft"
+import "6.824/src/labrpc"
+import "6.824/src/raft"
 import "sync"
-import "labgob"
-
-
+import "6.824/src/labgob"
 
 type Op struct {
 	// Your definitions here.
@@ -28,7 +25,6 @@ type ShardKV struct {
 	// Your definitions here.
 }
 
-
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 }
@@ -37,19 +33,15 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 }
 
-//
 // the tester calls Kill() when a ShardKV instance won't
 // be needed again. you are not required to do anything
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
-//
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
 }
 
-
-//
 // servers[] contains the ports of the servers in this group.
 //
 // me is the index of the current server in servers[].
@@ -76,7 +68,6 @@ func (kv *ShardKV) Kill() {
 //
 // StartServer() must return quickly, so it should start goroutines
 // for any long-running work.
-//
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, masters []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
@@ -96,7 +87,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
 
 	return kv
 }

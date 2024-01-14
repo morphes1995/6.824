@@ -4,14 +4,20 @@ package shardmaster
 // Shardmaster clerk.
 //
 
-import "labrpc"
-import "time"
+import (
+	"6.824/src/labrpc"
+	"sync"
+)
 import "crypto/rand"
 import "math/big"
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
+	mu            sync.Mutex
+	clientId      int64
+	requestId     int
+	currentLeader int
 }
 
 func nrand() int64 {
@@ -25,6 +31,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
+	ck.clientId = nrand()
+	ck.requestId = 0
+	ck.currentLeader = 0
 	return ck
 }
 
@@ -32,34 +41,63 @@ func (ck *Clerk) Query(num int) Config {
 	args := &QueryArgs{}
 	// Your code here.
 	args.Num = num
+	args.ClientId = ck.clientId
+	ck.mu.Lock()
+	args.RequestId = ck.requestId
+	ck.requestId++
+	ck.mu.Unlock()
+
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply QueryReply
-			ok := srv.Call("ShardMaster.Query", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return reply.Config
-			}
+		server := ck.servers[ck.currentLeader]
+		reply := QueryReply{}
+		ok := server.Call("ShardMaster.Query", args, &reply)
+		if ok && !reply.WrongLeader {
+			return reply.Config
 		}
-		time.Sleep(100 * time.Millisecond)
+		ck.currentLeader = (ck.currentLeader + 1) % len(ck.servers) // choose another possible raft leader
 	}
+
+	//for {
+	//	// try each known server.
+	//	for _, srv := range ck.servers {
+	//		var reply QueryReply
+	//		ok := srv.Call("ShardMaster.Query", args, &reply)
+	//		if ok && reply.WrongLeader == false {
+	//			return reply.Config
+	//		}
+	//	}
+	//	time.Sleep(100 * time.Millisecond)
+	//}
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
 	args := &JoinArgs{}
 	// Your code here.
 	args.Servers = servers
+	args.ClientId = ck.clientId
+	ck.mu.Lock()
+	args.RequestId = ck.requestId
+	ck.requestId++
+	ck.mu.Unlock()
 
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply JoinReply
-			ok := srv.Call("ShardMaster.Join", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
-			}
+		server := ck.servers[ck.currentLeader]
+		reply := JoinReply{}
+		ok := server.Call("ShardMaster.Join", args, &reply)
+		if ok && !reply.WrongLeader {
+			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		ck.currentLeader = (ck.currentLeader + 1) % len(ck.servers) // choose another possible raft leader
+
+		//// try each known server.
+		//for _, srv := range ck.servers {
+		//	var reply JoinReply
+		//	ok := srv.Call("ShardMaster.Join", args, &reply)
+		//	if ok && reply.WrongLeader == false {
+		//		return
+		//	}
+		//}
+		//time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -67,18 +105,35 @@ func (ck *Clerk) Leave(gids []int) {
 	args := &LeaveArgs{}
 	// Your code here.
 	args.GIDs = gids
+	// Your code here.
+	args.GIDs = gids
+	args.ClientId = ck.clientId
+	ck.mu.Lock()
+	args.RequestId = ck.requestId
+	ck.requestId++
+	ck.mu.Unlock()
 
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply LeaveReply
-			ok := srv.Call("ShardMaster.Leave", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
-			}
+		server := ck.servers[ck.currentLeader]
+		reply := LeaveReply{}
+		ok := server.Call("ShardMaster.Leave", args, &reply)
+		if ok && !reply.WrongLeader {
+			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		ck.currentLeader = (ck.currentLeader + 1) % len(ck.servers) // choose another possible raft leader
 	}
+
+	//for {
+	//	// try each known server.
+	//	for _, srv := range ck.servers {
+	//		var reply LeaveReply
+	//		ok := srv.Call("ShardMaster.Leave", args, &reply)
+	//		if ok && reply.WrongLeader == false {
+	//			return
+	//		}
+	//	}
+	//	time.Sleep(100 * time.Millisecond)
+	//}
 }
 
 func (ck *Clerk) Move(shard int, gid int) {
@@ -86,16 +141,31 @@ func (ck *Clerk) Move(shard int, gid int) {
 	// Your code here.
 	args.Shard = shard
 	args.GID = gid
+	args.ClientId = ck.clientId
+	ck.mu.Lock()
+	args.RequestId = ck.requestId
+	ck.requestId++
+	ck.mu.Unlock()
 
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply MoveReply
-			ok := srv.Call("ShardMaster.Move", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
-			}
+		server := ck.servers[ck.currentLeader]
+		reply := MoveReply{}
+		ok := server.Call("ShardMaster.Move", args, &reply)
+		if ok && !reply.WrongLeader {
+			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		ck.currentLeader = (ck.currentLeader + 1) % len(ck.servers) // choose another possible raft leader
 	}
+
+	//for {
+	//	// try each known server.
+	//	for _, srv := range ck.servers {
+	//		var reply MoveReply
+	//		ok := srv.Call("ShardMaster.Move", args, &reply)
+	//		if ok && reply.WrongLeader == false {
+	//			return
+	//		}
+	//	}
+	//	time.Sleep(100 * time.Millisecond)
+	//}
 }
