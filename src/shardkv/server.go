@@ -29,18 +29,6 @@ type OpResult struct {
 	Err Err
 }
 
-//type Result struct {
-//	Command     string
-//	OK          bool
-//	ClientId    int64
-//	RequestId   int64
-//	WrongLeader bool
-//	Err         Err
-//	Value       string
-//	// ReconfigureReply
-//	Num int
-//}
-
 type ShardKV struct {
 	mu           sync.Mutex
 	me           int
@@ -149,13 +137,13 @@ func (kv *ShardKV) appendLogEntry(entry Op) (bool, Err) {
 	var result bool
 	var err Err
 	select {
-	case entryRes := <-ch:
+	case entryApplied := <-ch:
 		// logs[index] may be changed and is not equal to `entry` , because the leadership change
 		// and old leader's log entry was overwritten by new leader's
-		if entryRes.Op == entry && entryRes.Err == OK {
+		if entryApplied.Op == entry && entryApplied.Err == OK {
 			result, err = true, OK
 		} else {
-			result, err = false, entryRes.Err
+			result, err = false, entryApplied.Err
 		}
 	case <-time.After(300 * time.Millisecond):
 		DPrintf("%v wait appendLogEntry timeout ", kv.me)
@@ -163,15 +151,11 @@ func (kv *ShardKV) appendLogEntry(entry Op) (bool, Err) {
 	}
 
 	kv.mu.Lock()
-	//if !kv.own(entry.Key) {
-	//	result, err = false, ErrWrongGroup // this kv server is not the owner of the shard that contains the key
-	//}
-
 	delete(kv.pendingRequests, index) // remove stale chan
 	kv.mu.Unlock()
 
 	PrintDetail(kv, entry, result, err)
-	return result, Err(err)
+	return result, err
 }
 
 func (kv *ShardKV) Run() {
@@ -184,39 +168,10 @@ func (kv *ShardKV) Run() {
 				// 1. apply snapshot
 				kv.applySnapshot(msg.Snapshot)
 			} else {
-
 				switch msg.Command.(type) {
 				case Op:
 					entry := msg.Command.(Op)
-
-					err := OK
-					if kv.own(entry.Key) {
-						requestId, ok := kv.ack[entry.ClientId]
-						if !ok || requestId < entry.RequestId {
-							// 2.1. apply state to kv server
-							kv.applyEntry(entry)
-							kv.ack[entry.ClientId] = entry.RequestId
-						}
-					} else {
-						err = ErrWrongGroup
-					}
-
-					// 2.2. notify pending operation
-					ch, ok := kv.pendingRequests[msg.CommandIndex]
-					if ok {
-						ch <- OpResult{Op: entry, Err: Err(err)}
-					}
-
-					// 2.3. create snapshot if raft state exceeds allowed size
-					if kv.maxraftstate != -1 && kv.rf.GetStateSize() >= kv.maxraftstate {
-						w := new(bytes.Buffer)
-						e := labgob.NewEncoder(w)
-
-						e.Encode(kv.data)
-						e.Encode(kv.ack)
-						e.Encode(kv.config)
-						go kv.rf.CreateSnapShot(w.Bytes(), msg.CommandIndex)
-					}
+					kv.applyNormalOperation(entry, msg.CommandIndex)
 				case ConfigurationOp:
 					entry := msg.Command.(ConfigurationOp)
 					kv.applyConfigurationChange(entry, msg.CommandIndex)
@@ -229,6 +184,37 @@ func (kv *ShardKV) Run() {
 			return
 
 		}
+	}
+}
+
+func (kv *ShardKV) applyNormalOperation(entry Op, commitIndex int) {
+	err := OK
+	if kv.own(entry.Key) {
+		requestId, ok := kv.ack[entry.ClientId]
+		if !ok || requestId < entry.RequestId {
+			// 2.1. apply state to kv server
+			kv.applyEntry(entry)
+			kv.ack[entry.ClientId] = entry.RequestId
+		}
+	} else {
+		err = ErrWrongGroup
+	}
+
+	// 2.2. notify pending operation
+	ch, ok := kv.pendingRequests[commitIndex]
+	if ok {
+		ch <- OpResult{Op: entry, Err: Err(err)}
+	}
+
+	// 2.3. create snapshot if raft state exceeds allowed size
+	if kv.maxraftstate != -1 && kv.rf.GetStateSize() >= kv.maxraftstate {
+		w := new(bytes.Buffer)
+		e := labgob.NewEncoder(w)
+
+		e.Encode(kv.data)
+		e.Encode(kv.ack)
+		e.Encode(kv.config)
+		go kv.rf.CreateSnapShot(w.Bytes(), commitIndex)
 	}
 }
 

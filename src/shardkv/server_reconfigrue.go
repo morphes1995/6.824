@@ -20,14 +20,12 @@ func (kv *ShardKV) Reconfigure() {
 		if _, isLeader := kv.rf.GetState(); !isLeader {
 			continue
 		}
-
 		latestConf := kv.mck.Query(-1)
 		// for each newer configuration changes
 		for i := kv.config.Num + 1; i <= latestConf.Num; i++ {
 			conf := kv.mck.Query(i)
-			args, ok := kv.getConfiguration(conf)
-
-			if !ok || !kv.updateConfiguration(args) {
+			op, ok := kv.getConfigurationOp(conf)
+			if !ok || !kv.appendConfigurationLogEntry(op) {
 				// reconfiguration failed in this turn
 				break
 			}
@@ -37,40 +35,31 @@ func (kv *ShardKV) Reconfigure() {
 	}
 }
 
-func (kv *ShardKV) getConfiguration(nextConfig shardmaster.Config) (Configuration, bool) {
-	configuration := Configuration{}
-	configuration.Config = nextConfig
-	configuration.Ack = make(map[int64]int64)
+func (kv *ShardKV) getConfigurationOp(nextConfig shardmaster.Config) (ConfigurationOp, bool) {
+	confOp := ConfigurationOp{}
+	confOp.Config = nextConfig
+	confOp.Ack = make(map[int64]int64)
 	for i := 0; i < shardmaster.NShards; i++ {
-		configuration.Data[i] = make(map[string]string)
+		confOp.Data[i] = make(map[string]string)
 	}
 
-	groupToMoveShards := make(map[int][]int) // groups that contains shards to move
-	for i := 0; i < shardmaster.NShards; i++ {
-		// for each shard,  find the shards that not belong to this replica group ,
-		// but will belong to this replica group in next configuration.  and then move them to me
-		if kv.config.Shards[i] != kv.gid && nextConfig.Shards[i] == kv.gid {
-			gid := kv.config.Shards[i]
-			if gid != 0 {
-				if _, ok := groupToMoveShards[gid]; !ok {
-					groupToMoveShards[gid] = []int{i}
-				} else {
-					groupToMoveShards[gid] = append(groupToMoveShards[gid], i)
-				}
-			}
-		}
-	}
+	groupToMoveShards := kv.findShardsShouldMove(nextConfig) // groups that contains shards to move
 
+	ok := kv.fetchShardsInfoFromOldReplicaGroup(&confOp, groupToMoveShards, nextConfig)
+	return confOp, ok
+}
+
+func (kv *ShardKV) fetchShardsInfoFromOldReplicaGroup(confOp *ConfigurationOp, groupToMoveShards map[int][]int, nextConfig shardmaster.Config) bool {
 	retOk := true
 	var ackMutex sync.Mutex
-	var wait sync.WaitGroup
+	var wg sync.WaitGroup
 	for gid, shardsToMoveThere := range groupToMoveShards {
 		if len(shardsToMoveThere) == 0 {
 			continue
 		}
-		wait.Add(1)
-		go func(gid int, shardsToMoveThere []int) {
-			defer wait.Done()
+		wg.Add(1)
+		go func(confOp *ConfigurationOp, gid int, shardsToMoveThere []int) {
+			defer wg.Done()
 
 			moveArgs := MoveShardArgs{}
 			moveArgs.Num = nextConfig.Num
@@ -81,28 +70,48 @@ func (kv *ShardKV) getConfiguration(nextConfig shardmaster.Config) (Configuratio
 				ackMutex.Lock()
 				for shardIndex, shardData := range reply.Data {
 					for k, v := range shardData {
-						configuration.Data[shardIndex][k] = v
+						confOp.Data[shardIndex][k] = v
 					}
 				}
 				for clientId := range reply.Ack {
-					_, ok := configuration.Ack[clientId]
-					if !ok || configuration.Ack[clientId] < reply.Ack[clientId] {
-						configuration.Ack[clientId] = reply.Ack[clientId]
+					_, ok := confOp.Ack[clientId]
+					if !ok || confOp.Ack[clientId] < reply.Ack[clientId] {
+						confOp.Ack[clientId] = reply.Ack[clientId]
 					}
 				}
 				ackMutex.Unlock()
 			} else {
 				retOk = false
 			}
-		}(gid, shardsToMoveThere)
+		}(confOp, gid, shardsToMoveThere)
 	}
-	wait.Wait()
-	return configuration, retOk
+
+	// Make sure that all replica servers in a replica group do the migration at the same point
+	// they all either accept or reject concurrent client requests.
+	wg.Wait()
+
+	return retOk
+}
+
+func (kv *ShardKV) findShardsShouldMove(nextConfig shardmaster.Config) map[int][]int {
+	groupToMoveShards := make(map[int][]int)
+	for i := 0; i < shardmaster.NShards; i++ {
+		gid := kv.config.Shards[i]
+		if gid == 0 {
+			continue
+		}
+		// for each shard,  find the shards that not belong to this replica group ,
+		// but will belong to this replica group in next confOp.  these shards will be moved to me latter
+		if gid != kv.gid && nextConfig.Shards[i] == kv.gid {
+			groupToMoveShards[gid] = append(groupToMoveShards[gid], i)
+		}
+	}
+
+	return groupToMoveShards
 }
 
 func (kv *ShardKV) sendMoveShard(gid int, args *MoveShardArgs, reply *MoveShardReply) bool {
-	// Make sure that all replica servers in a replica group do the migration at the same point
-	// they all either accept or reject concurrent client requests.
+	// make sure at least one server in source replica group was applied new configuration
 	for _, server := range kv.config.Groups[gid] {
 		srv := kv.make_end(server)
 		ok := srv.Call("ShardKV.MoveShard", args, reply)
@@ -116,7 +125,7 @@ func (kv *ShardKV) sendMoveShard(gid int, args *MoveShardArgs, reply *MoveShardR
 			}
 		}
 	}
-	// all source  replica server are not ready,wait for next loop
+	// wait for next loop
 	return false
 }
 
@@ -146,17 +155,6 @@ func (kv *ShardKV) MoveShard(args *MoveShardArgs, reply *MoveShardReply) {
 		reply.Ack[clientId] = requestId
 	}
 	reply.Err = OK
-}
-
-func (kv *ShardKV) updateConfiguration(conf Configuration) bool {
-	entry := ConfigurationOp{
-		Config: conf.Config,
-		Data:   conf.Data,
-		Ack:    conf.Ack,
-	}
-
-	result := kv.appendConfigurationLogEntry(entry)
-	return result
 }
 
 func (kv *ShardKV) appendConfigurationLogEntry(entry ConfigurationOp) bool {
