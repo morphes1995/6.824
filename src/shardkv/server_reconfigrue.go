@@ -65,6 +65,9 @@ func (kv *ShardKV) getConfiguration(nextConfig shardmaster.Config) (Configuratio
 	var ackMutex sync.Mutex
 	var wait sync.WaitGroup
 	for gid, shardsToMoveThere := range groupToMoveShards {
+		if len(shardsToMoveThere) == 0 {
+			continue
+		}
 		wait.Add(1)
 		go func(gid int, shardsToMoveThere []int) {
 			defer wait.Done()
@@ -103,16 +106,18 @@ func (kv *ShardKV) sendMoveShard(gid int, args *MoveShardArgs, reply *MoveShardR
 	for _, server := range kv.config.Groups[gid] {
 		srv := kv.make_end(server)
 		ok := srv.Call("ShardKV.MoveShard", args, reply)
+		DPrintf("%v  moved shard from %v, gid %v, args.shardIds %v, reply data %v, ok %v, reply err %v", kv.me, server, gid, args.ShardIds, reply.Data, ok, reply.Err)
 		if ok {
 			if reply.Err == OK {
 				return true
 			}
 			if reply.Err == ErrNotReady {
-				return false
+				continue
 			}
 		}
 	}
-	return true
+	// all source  replica server are not ready,wait for next loop
+	return false
 }
 
 func (kv *ShardKV) MoveShard(args *MoveShardArgs, reply *MoveShardReply) {

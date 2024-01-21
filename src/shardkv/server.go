@@ -145,26 +145,32 @@ func (kv *ShardKV) appendLogEntry(entry Op) (bool, Err) {
 	kv.mu.Unlock()
 
 	// wait for raft to commit and apply this op
-	result, err := false, WrongLeader
+	//result, err := false, WrongLeader
+	var result bool
+	var err Err
 	select {
 	case entryRes := <-ch:
 		// logs[index] may be changed and is not equal to `entry` , because the leadership change
 		// and old leader's log entry was overwritten by new leader's
-		if entryRes.Op == entry {
+		if entryRes.Op == entry && entryRes.Err == OK {
 			result, err = true, OK
+		} else {
+			result, err = false, entryRes.Err
 		}
 	case <-time.After(300 * time.Millisecond):
 		DPrintf("%v wait appendLogEntry timeout ", kv.me)
+		result, err = false, WrongLeader
 	}
 
 	kv.mu.Lock()
-	if !kv.own(entry.Key) {
-		result, err = false, ErrWrongGroup // this kv server is not the owner of the shard that contains the key
-	}
+	//if !kv.own(entry.Key) {
+	//	result, err = false, ErrWrongGroup // this kv server is not the owner of the shard that contains the key
+	//}
+
 	delete(kv.pendingRequests, index) // remove stale chan
 	kv.mu.Unlock()
 
-	DPrintf("%v finish appendLogEntry ,op %v,  result %v , err %v ", kv.me, entry.Command, result, err)
+	PrintDetail(kv, entry, result, err)
 	return result, Err(err)
 }
 
@@ -183,7 +189,7 @@ func (kv *ShardKV) Run() {
 				case Op:
 					entry := msg.Command.(Op)
 
-					err := ""
+					err := OK
 					if kv.own(entry.Key) {
 						requestId, ok := kv.ack[entry.ClientId]
 						if !ok || requestId < entry.RequestId {
