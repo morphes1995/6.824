@@ -17,7 +17,7 @@ type Op struct {
 	// otherwise RPC will break.
 
 	ClientId  int64
-	RequestId int
+	RequestId int64
 	Command   string
 
 	Key   string
@@ -52,10 +52,11 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	stopCh          chan any
-	data            [shardmaster.NShards]map[string]string // each shard has a kv map
-	ack             map[int64]int
-	pendingRequests map[int]chan OpResult
+	stopCh                       chan any
+	data                         [shardmaster.NShards]map[string]string // each shard has a kv map
+	ack                          map[int64]int64
+	pendingRequests              map[int]chan OpResult
+	pendingConfigurationRequests map[int]chan ConfigurationOp
 
 	config shardmaster.Config
 	mck    *shardmaster.Clerk
@@ -114,15 +115,22 @@ func (kv *ShardKV) isMatch(entry1 Op, entry2 Op) bool {
 }
 
 func (kv *ShardKV) appendLogEntry(entry Op) (bool, Err) {
-	//kv.mu.Lock()
-	//requestId, ok := kv.ack[entry.ClientId]
-	//if ok && requestId >= entry.RequestId { // ignore requests that already processed
-	//	kv.mu.Unlock()
-	//	DPrintf("request %d already processed", entry.RequestId)
-	//	return true,OK
-	//}
-	//kv.mu.Unlock()
+	// pre-check invalid operations
+	kv.mu.Lock()
+	if !kv.own(entry.Key) {
+		kv.mu.Unlock()
+		return false, ErrWrongGroup
+	}
 
+	requestId, ok := kv.ack[entry.ClientId]
+	if ok && requestId >= entry.RequestId { // ignore requests that already processed
+		kv.mu.Unlock()
+		DPrintf("request %d already processed", entry.RequestId)
+		return true, OK
+	}
+	kv.mu.Unlock()
+
+	// write raft log
 	index, _, isLeader := kv.rf.Start(entry)
 	if !isLeader {
 		return false, WrongLeader
@@ -170,36 +178,44 @@ func (kv *ShardKV) Run() {
 				// 1. apply snapshot
 				kv.applySnapshot(msg.Snapshot)
 			} else {
-				entry := msg.Command.(Op)
 
-				err := ""
-				if kv.own(entry.Key) {
-					requestId, ok := kv.ack[entry.ClientId]
-					if !ok || requestId < entry.RequestId {
-						// 2.1. apply state to kv server
-						kv.applyEntry(entry)
-						kv.ack[entry.ClientId] = entry.RequestId
+				switch msg.Command.(type) {
+				case Op:
+					entry := msg.Command.(Op)
+
+					err := ""
+					if kv.own(entry.Key) {
+						requestId, ok := kv.ack[entry.ClientId]
+						if !ok || requestId < entry.RequestId {
+							// 2.1. apply state to kv server
+							kv.applyEntry(entry)
+							kv.ack[entry.ClientId] = entry.RequestId
+						}
+					} else {
+						err = ErrWrongGroup
 					}
-				} else {
-					err = ErrWrongGroup
+
+					// 2.2. notify pending operation
+					ch, ok := kv.pendingRequests[msg.CommandIndex]
+					if ok {
+						ch <- OpResult{Op: entry, Err: Err(err)}
+					}
+
+					// 2.3. create snapshot if raft state exceeds allowed size
+					if kv.maxraftstate != -1 && kv.rf.GetStateSize() >= kv.maxraftstate {
+						w := new(bytes.Buffer)
+						e := labgob.NewEncoder(w)
+
+						e.Encode(kv.data)
+						e.Encode(kv.ack)
+						e.Encode(kv.config)
+						go kv.rf.CreateSnapShot(w.Bytes(), msg.CommandIndex)
+					}
+				case ConfigurationOp:
+					entry := msg.Command.(ConfigurationOp)
+					kv.applyConfigurationChange(entry, msg.CommandIndex)
 				}
 
-				// 2.2. notify pending operation
-				ch, ok := kv.pendingRequests[msg.CommandIndex]
-				if ok {
-					ch <- OpResult{Op: entry, Err: Err(err)}
-				}
-
-				// 2.3. create snapshot if raft state exceeds allowed size
-				if kv.maxraftstate != -1 && kv.rf.GetStateSize() >= kv.maxraftstate {
-					w := new(bytes.Buffer)
-					e := labgob.NewEncoder(w)
-
-					e.Encode(kv.data)
-					e.Encode(kv.ack)
-					e.Encode(kv.config)
-					go kv.rf.CreateSnapShot(w.Bytes(), msg.CommandIndex)
-				}
 			}
 			kv.mu.Unlock()
 
@@ -207,13 +223,6 @@ func (kv *ShardKV) Run() {
 			return
 
 		}
-	}
-}
-
-func (kv *ShardKV) Reconfigure() {
-	for {
-		kv.config = kv.mck.Query(-1)
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -303,11 +312,12 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg, 100)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	kv.ack = make(map[int64]int)
+	kv.ack = make(map[int64]int64)
 	kv.pendingRequests = make(map[int]chan OpResult)
 
 	go kv.Run()
-	go kv.Reconfigure()
+
+	InitReconfiguration(kv)
 
 	return kv
 }

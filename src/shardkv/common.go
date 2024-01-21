@@ -1,6 +1,9 @@
 package shardkv
 
-import "log"
+import (
+	"6.824/src/shardmaster"
+	"log"
+)
 
 //
 // Sharded key/value server.
@@ -16,10 +19,12 @@ const (
 	ErrNoKey      = "ErrNoKey"
 	ErrWrongGroup = "ErrWrongGroup"
 	WrongLeader   = "WrongLeader"
+	ErrNotReady   = "ErrNotReady"
 
-	Append = "Append"
-	Put    = "Put"
-	Get    = "Get"
+	Append          = "Append"
+	Put             = "Put"
+	Get             = "Get"
+	Reconfiguration = "Reconfiguration"
 )
 
 type Err string
@@ -31,7 +36,7 @@ type PutAppendArgs struct {
 	Value     string
 	Op        string // "Put" or "Append"
 	ClientId  int64
-	RequestId int
+	RequestId int64
 
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
@@ -46,7 +51,7 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key       string
 	ClientId  int64
-	RequestId int
+	RequestId int64
 
 	// You'll have to add definitions here.
 }
@@ -55,6 +60,36 @@ type GetReply struct {
 	WrongLeader bool
 	Err         Err
 	Value       string
+}
+
+type Configuration struct {
+	Config shardmaster.Config
+	Data   [shardmaster.NShards]map[string]string
+	Ack    map[int64]int64
+}
+
+type ReconfigureReply struct {
+	Err Err
+	Num int
+}
+
+type MoveShardArgs struct {
+	Num      int
+	ShardIds []int
+}
+
+type MoveShardReply struct {
+	Err  Err
+	Data [shardmaster.NShards]map[string]string
+	Ack  map[int64]int64
+}
+
+func CopyMap(m map[string]string) (copied map[string]string) {
+	copied = make(map[string]string)
+	for k, v := range m {
+		copied[k] = v
+	}
+	return
 }
 
 const Debug = 1
