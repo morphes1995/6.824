@@ -95,15 +95,18 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-func PrintDetail(kv *ShardKV, entry Op, result bool, err Err) {
+func PrintDetail(kv *ShardKV, entry Op) {
 	term, isLeader := kv.rf.GetState()
+	//if !isLeader {
+	//	return
+	//}
 	switch entry.Command {
 	case Get:
-		DPrintf("%v,gid %v,leader %v term %v, finish appendLogEntry ,op %v,  result %v , key %v, err %v , shardId %v, shard %v, conf %v %v",
-			kv.me, kv.gid, isLeader, term, entry.Command, result, entry.Key, err, key2shard(entry.Key), kv.data[key2shard(entry.Key)], kv.config.Num, kv.config.Shards)
+		DPrintf("%v,gid %v,leader %v term %v, finish appendLogEntry ,op %v , key %v , shardId %v, shard %v, conf %v %v",
+			kv.me, kv.gid, isLeader, term, entry.Command, entry.Key, key2shard(entry.Key), kv.data[key2shard(entry.Key)], kv.config.Num, kv.config.Shards)
 	case Append, Put:
-		DPrintf("%v, gid %v,leader %v term %v, finish appendLogEntry ,op %v,  result %v , key %v, value %v,  err %v ,shardId %v, shard %v,  conf %v %v",
-			kv.me, kv.gid, isLeader, term, entry.Command, result, entry.Key, entry.Value, err, key2shard(entry.Key), kv.data[key2shard(entry.Key)], kv.config.Num, kv.config.Shards)
+		DPrintf("%v, gid %v,leader %v term %v, finish appendLogEntry ,op %v , key %v, value %v,shardId %v, shard %v,  conf %v %v",
+			kv.me, kv.gid, isLeader, term, entry.Command, entry.Key, entry.Value, key2shard(entry.Key), kv.data[key2shard(entry.Key)], kv.config.Num, kv.config.Shards)
 	}
 
 }

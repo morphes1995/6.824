@@ -45,6 +45,7 @@ type ShardKV struct {
 	ack                          map[int64]int64
 	pendingRequests              map[int]chan OpResult
 	pendingConfigurationRequests map[int]chan ConfigurationOp
+	pendingCleanUpRequests       map[int]chan CleanUpOp
 
 	config shardmaster.Config
 	mck    *shardmaster.Clerk
@@ -152,9 +153,13 @@ func (kv *ShardKV) appendLogEntry(entry Op) (bool, Err) {
 
 	kv.mu.Lock()
 	delete(kv.pendingRequests, index) // remove stale chan
+	if !kv.own(entry.Key) {
+		kv.mu.Unlock()
+		return false, ErrWrongGroup
+	}
 	kv.mu.Unlock()
 
-	PrintDetail(kv, entry, result, err)
+	//PrintDetail(kv, entry, result, err)
 	return result, err
 }
 
@@ -175,8 +180,20 @@ func (kv *ShardKV) Run() {
 				case ConfigurationOp:
 					entry := msg.Command.(ConfigurationOp)
 					kv.applyConfigurationChange(entry, msg.CommandIndex)
+				case CleanUpOp:
+					entry := msg.Command.(CleanUpOp)
+					kv.applyCleanup(entry, msg.CommandIndex)
 				}
+				// 2.3. create snapshot if raft state exceeds allowed size
+				if kv.maxraftstate != -1 && kv.rf.GetStateSize() >= kv.maxraftstate {
+					w := new(bytes.Buffer)
+					e := labgob.NewEncoder(w)
 
+					e.Encode(kv.data)
+					e.Encode(kv.ack)
+					e.Encode(kv.config)
+					go kv.rf.CreateSnapShot(w.Bytes(), msg.CommandIndex)
+				}
 			}
 			kv.mu.Unlock()
 
@@ -206,16 +223,6 @@ func (kv *ShardKV) applyNormalOperation(entry Op, commitIndex int) {
 		ch <- OpResult{Op: entry, Err: Err(err)}
 	}
 
-	// 2.3. create snapshot if raft state exceeds allowed size
-	if kv.maxraftstate != -1 && kv.rf.GetStateSize() >= kv.maxraftstate {
-		w := new(bytes.Buffer)
-		e := labgob.NewEncoder(w)
-
-		e.Encode(kv.data)
-		e.Encode(kv.ack)
-		e.Encode(kv.config)
-		go kv.rf.CreateSnapShot(w.Bytes(), commitIndex)
-	}
 }
 
 func (kv *ShardKV) applyEntry(entry Op) {
@@ -227,6 +234,7 @@ func (kv *ShardKV) applyEntry(entry Op) {
 	case Append:
 		kv.data[key2shard(entry.Key)][entry.Key] += entry.Value
 	}
+	PrintDetail(kv, entry)
 }
 
 func (kv *ShardKV) applySnapshot(snapshot []byte) {
