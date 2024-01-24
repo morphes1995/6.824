@@ -19,12 +19,12 @@ package raft
 
 import (
 	"6.824/src/labgob"
-	"6.824/src/labrpc"
 	"bytes"
 	"math/rand"
 	"sync"
 	"time"
 )
+import "6.824/src/labrpc"
 
 // import "bytes"
 // import "labgob"
@@ -436,8 +436,8 @@ func (rf *Raft) applyLog() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	baseIndex := rf.logs[0].LogIndex
-	//DPrintf2("%d apply log , rf.lastApplied %d, rf.commitIndex %d, baseIndex:%d , len(log): %d",
-	//	rf.me, rf.lastApplied, rf.commitIndex, baseIndex, len(rf.logs))
+	DPrintf("%d apply log , rf.lastApplied %d, rf.commitIndex %d, baseIndex:%d",
+		rf.me, rf.lastApplied, rf.commitIndex, baseIndex)
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		rf.applyC <- ApplyMsg{CommandIndex: i, CommandValid: true, Command: rf.logs[i-baseIndex].Command}
 	}
