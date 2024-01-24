@@ -3,6 +3,7 @@ package shardkv
 import (
 	"6.824/src/labgob"
 	"6.824/src/shardmaster"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -12,26 +13,30 @@ type ConfigurationOp struct {
 	Config shardmaster.Config
 	Data   [shardmaster.NShards]map[string]string
 	Ack    map[int64]int64
+	Err    Err
 }
 
+// Reconfigure Process re-configurations one at a time, in order.
 func (kv *ShardKV) Reconfigure() {
 	for {
+		time.Sleep(80 * time.Millisecond)
 		// only leader of a replica group can detect configuration change
 		if _, isLeader := kv.rf.GetState(); !isLeader {
 			continue
 		}
-		latestConf := kv.mck.Query(-1)
-		// for each newer configuration changes
-		for i := kv.config.Num + 1; i <= latestConf.Num; i++ {
-			conf := kv.mck.Query(i)
-			op, ok := kv.getConfigurationOp(conf)
+
+		kv.mu.Lock()
+		curConfig := kv.config
+		kv.mu.Unlock()
+
+		nextConfig := kv.mck.Query(curConfig.Num + 1)
+		if nextConfig.Num == curConfig.Num+1 {
+			op, ok := kv.getConfigurationOp(nextConfig)
 			if !ok || !kv.appendConfigurationLogEntry(op) {
 				// reconfiguration failed in this turn
-				break
+				continue
 			}
 		}
-
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -115,23 +120,31 @@ func (kv *ShardKV) sendMoveShard(gid int, args *MoveShardArgs, reply *MoveShardR
 	for _, server := range kv.config.Groups[gid] {
 		srv := kv.make_end(server)
 		ok := srv.Call("ShardKV.MoveShard", args, reply)
-		DPrintf("%v  moved shard from %v, gid %v, args.shardIds %v, reply data %v, ok %v, reply err %v", kv.me, server, gid, args.ShardIds, reply.Data, ok, reply.Err)
+		DPrintf("%s  moved shard from %v, gid %v, args.shardIds %v, reply data %v, ok %v, reply err %v, conf %v -> %v",
+			kv.myInfo(), server, gid, args.ShardIds, reply.Data, ok, reply.Err, kv.config.Num, args.Num)
 		if ok {
 			if reply.Err == OK {
 				return true
-			}
-			if reply.Err == ErrNotReady {
+			} else {
 				continue
 			}
 		}
 	}
-	// wait for next loop
 	return false
+}
+
+func (kv *ShardKV) myInfo() string {
+	return fmt.Sprintf("%v gid %v ", kv.me, kv.gid)
 }
 
 func (kv *ShardKV) MoveShard(args *MoveShardArgs, reply *MoveShardReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = WrongLeader
+		return
+	}
 
 	// this shard server may still handle the requested shards
 	if kv.config.Num < args.Num {
@@ -139,6 +152,7 @@ func (kv *ShardKV) MoveShard(args *MoveShardArgs, reply *MoveShardReply) {
 		//  a pair of groups may need to move shards in both directions between them
 		//  in case shard1 (group1 -> group2) while shard2 (group2->group1)
 		reply.Err = ErrNotReady
+		DPrintf("%s may exists deadlock kv.config.Num %v args.Num %v", kv.myInfo(), kv.config.Num, args.Num)
 		return
 	}
 
@@ -148,8 +162,7 @@ func (kv *ShardKV) MoveShard(args *MoveShardArgs, reply *MoveShardReply) {
 	for _, shardId := range args.ShardIds {
 		reply.Data[shardId] = CopyMap(kv.data[shardId])
 	}
-	// todo it is acceptable to continue to store shards that it no longer owns
-
+	// the shards that replica group no longer owns will be removed when it sent to target replica group successfully
 	reply.Ack = make(map[int64]int64)
 	for clientId, requestId := range kv.ack { // todo may be we can only send acks about the moved shards
 		reply.Ack[clientId] = requestId
@@ -176,18 +189,18 @@ func (kv *ShardKV) appendConfigurationLogEntry(entry ConfigurationOp) bool {
 	result := false
 	select {
 	case entryResult := <-ch:
-		if entryResult.Config.Num == entry.Config.Num {
+		if entryResult.Config.Num == entry.Config.Num && entryResult.Err == OK {
 			result = true
 		}
 	case <-time.After(300 * time.Millisecond):
-		DPrintf("%v wait appendConfigurationLogEntry timeout ", kv.me)
+		DPrintf("%s wait appendConfigurationLogEntry timeout ", kv.myInfo())
 	}
 
 	kv.mu.Lock()
 	delete(kv.pendingConfigurationRequests, index) // remove stale chan
 	kv.mu.Unlock()
 
-	DPrintf("%v finish appendConfigurationLogEntry ,conf %v,  result %v ", kv.me, entry.Config, result)
+	DPrintf("%s finish appendConfigurationLogEntry ,conf %v,  result %v ", kv.myInfo(), entry.Config, result)
 	return result
 
 }
@@ -197,32 +210,56 @@ func (kv *ShardKV) applyConfigurationChange(conf ConfigurationOp, commitIndex in
 		return
 	}
 
-	for shardId, shardData := range conf.Data {
-		for k, v := range shardData {
-			kv.data[shardId][k] = v
+	err := OK
+	oldConf := kv.config
+	if conf.Config.Num != kv.config.Num+1 {
+		err = ErrNotReady
+	} else {
+		for shardId, shardData := range conf.Data {
+			for k, v := range shardData {
+				kv.data[shardId][k] = v
+			}
 		}
-	}
-	for clientId := range conf.Ack {
-		_, ok := kv.ack[clientId]
-		if !ok || kv.ack[clientId] < conf.Ack[clientId] {
-			kv.ack[clientId] = conf.Ack[clientId]
+		for clientId := range conf.Ack {
+			_, ok := kv.ack[clientId]
+			if !ok || kv.ack[clientId] < conf.Ack[clientId] {
+				kv.ack[clientId] = conf.Ack[clientId]
+			}
 		}
-	}
-	kv.config = conf.Config
+		kv.config = conf.Config
 
+	}
+
+	conf.Err = Err(err)
 	// notify pending operation
 	ch, ok := kv.pendingConfigurationRequests[commitIndex]
 	if ok {
 		ch <- conf
 	}
+
+	if err == OK {
+		for shardId, shardData := range conf.Data {
+			if len(shardData) > 0 {
+				oldGid := oldConf.Shards[shardId]
+				args := CleanupShardArgs{
+					ShardId: shardId,
+					Num:     oldConf.Num,
+				}
+				go kv.sendCleanupShard(oldGid, &oldConf, &args)
+			}
+		}
+	}
+
 }
 
 // InitReconfiguration init reconfiguration subsystem
 func InitReconfiguration(kv *ShardKV) {
 	labgob.Register(ConfigurationOp{})
 	labgob.Register(shardmaster.Config{})
+	labgob.Register(CleanUpOp{})
 
 	kv.pendingConfigurationRequests = make(map[int]chan ConfigurationOp)
+	kv.pendingCleanUpRequests = make(map[int]chan CleanUpOp)
 	go kv.Reconfigure()
 
 }
