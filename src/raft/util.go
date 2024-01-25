@@ -11,3 +11,8 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	}
 	return
 }
+
+func DPrint2(format string, a ...interface{}) (n int, err error) {
+	log.Printf("[raft]--"+format, a...)
+	return
+}

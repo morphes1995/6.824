@@ -19,12 +19,12 @@ package raft
 
 import (
 	"6.824/src/labgob"
+	"6.824/src/labrpc"
 	"bytes"
 	"math/rand"
 	"sync"
 	"time"
 )
-import "6.824/src/labrpc"
 
 // import "bytes"
 // import "labgob"
@@ -436,8 +436,11 @@ func (rf *Raft) applyLog() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	baseIndex := rf.logs[0].LogIndex
-	DPrintf("%d apply log , rf.lastApplied %d, rf.commitIndex %d, baseIndex:%d",
-		rf.me, rf.lastApplied, rf.commitIndex, baseIndex)
+	if rf.commitIndex > rf.getLastLogIndex() { // double check commit index range
+		DPrintf("warning, %v rf.commitIndex > rf.getLastLogIndex() %v > %v, update rf.commitIndex to %v", rf.me, rf.commitIndex, rf.getLastLogIndex(), rf.getLastLogIndex())
+		rf.commitIndex = rf.getLastLogIndex()
+	}
+
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		rf.applyC <- ApplyMsg{CommandIndex: i, CommandValid: true, Command: rf.logs[i-baseIndex].Command}
 	}
@@ -619,7 +622,10 @@ func (rf *Raft) broadcastAppendEntries() {
 				args.LeaderCommit = rf.commitIndex
 
 				args.PrevLogIndex = rf.nextIndex[i] - 1
-				args.PrevLogTerm = rf.logs[args.PrevLogIndex-baseIndex].Term
+
+				if args.PrevLogIndex <= rf.getLastLogIndex() {
+					args.PrevLogTerm = rf.logs[args.PrevLogIndex-baseIndex].Term
+				}
 
 				// entries need be sent to followers
 				if rf.nextIndex[i] <= rf.getLastLogIndex() {
@@ -810,6 +816,7 @@ func (rf *Raft) recoverFromSnapshot(snapshot []byte) {
 
 	rf.lastApplied = lastIncludedIndex
 	rf.commitIndex = lastIncludedIndex
+	rf.trimLog(lastIncludedIndex, lastIncludedTerm)
 
 	msg := ApplyMsg{IsSnapshot: true, Snapshot: snapshot}
 	rf.applyC <- msg // notify application to deal with snapshot msg
@@ -851,8 +858,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.discoverHigherTermC = make(chan bool, 100)
 	rf.killC = make(chan bool)
 
-	rf.recoverFromSnapshot(persister.ReadSnapshot())
-
 	prevState := persister.ReadRaftState()
 	if prevState == nil || len(prevState) < 1 {
 		// first bootstrap
@@ -866,6 +871,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.readPersist(prevState)
 		DPrintf("%d read from persister, %p", rf.me, rf)
 	}
+
+	rf.recoverFromSnapshot(persister.ReadSnapshot())
 
 	go rf.Run()
 
