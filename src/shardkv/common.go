@@ -86,7 +86,7 @@ func CopyMap(m map[string]string) (copied map[string]string) {
 	return
 }
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -96,14 +96,13 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 func PrintDetail(kv *ShardKV, entry Op, result bool, err Err) {
-	term, isLeader := kv.rf.GetState()
 	switch entry.Command {
 	case Get:
-		DPrintf("%v,gid %v,leader %v term %v, finish appendLogEntry ,op %v,  result %v , key %v, err %v , shardId %v, shard %v, conf %v %v",
-			kv.me, kv.gid, isLeader, term, entry.Command, result, entry.Key, err, key2shard(entry.Key), kv.data[key2shard(entry.Key)], kv.config.Num, kv.config.Shards)
+		DPrintf("%s, finish appendLogEntry ,op %v,  result %v , key %v, err %v , shardId %v, shard %v, conf %v %v",
+			kv.myInfo(), entry.Command, result, entry.Key, err, key2shard(entry.Key), kv.data[key2shard(entry.Key)], kv.config.Num, kv.config.Shards)
 	case Append, Put:
-		DPrintf("%v, gid %v,leader %v term %v, finish appendLogEntry ,op %v,  result %v , key %v, value %v,  err %v ,shardId %v, shard %v,  conf %v %v",
-			kv.me, kv.gid, isLeader, term, entry.Command, result, entry.Key, entry.Value, err, key2shard(entry.Key), kv.data[key2shard(entry.Key)], kv.config.Num, kv.config.Shards)
+		DPrintf("%s, finish appendLogEntry ,op %v,  result %v , key %v, value %v,  err %v ,shardId %v, shard %v,  conf %v %v",
+			kv.myInfo(), entry.Command, result, entry.Key, entry.Value, err, key2shard(entry.Key), kv.data[key2shard(entry.Key)], kv.config.Num, kv.config.Shards)
 	}
 
 }

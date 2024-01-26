@@ -41,6 +41,7 @@ type ShardKV struct {
 
 	// Your definitions here.
 	stopCh                       chan any
+	stopReconfigureCh            chan any
 	data                         [shardmaster.NShards]map[string]string // each shard has a kv map
 	ack                          map[int64]int64
 	pendingRequests              map[int]chan OpResult
@@ -253,6 +254,7 @@ func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
 	kv.stopCh <- true
+	kv.stopReconfigureCh <- true
 }
 
 // StartServer servers[] contains the ports of the servers in this group.
@@ -305,6 +307,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	}
 
 	kv.stopCh = make(chan any, 1)
+	kv.stopReconfigureCh = make(chan any, 1)
 	kv.applyCh = make(chan raft.ApplyMsg, 100)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 

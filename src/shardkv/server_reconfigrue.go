@@ -19,7 +19,12 @@ type ConfigurationOp struct {
 // Reconfigure Process re-configurations one at a time, in order.
 func (kv *ShardKV) Reconfigure() {
 	for {
-		time.Sleep(80 * time.Millisecond)
+		select {
+		case <-kv.stopReconfigureCh:
+			return
+		case <-time.After(80 * time.Millisecond):
+		}
+
 		// only leader of a replica group can detect configuration change
 		if _, isLeader := kv.rf.GetState(); !isLeader {
 			continue
@@ -227,6 +232,7 @@ func (kv *ShardKV) applyConfigurationChange(conf ConfigurationOp, commitIndex in
 			}
 		}
 		kv.config = conf.Config
+		DPrintf("%s apply config from %v to %v", kv.myInfo(), oldConf, conf.Config)
 
 	}
 
