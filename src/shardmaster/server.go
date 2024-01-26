@@ -4,6 +4,7 @@ import (
 	"6.824/src/labgob"
 	"6.824/src/labrpc"
 	"6.824/src/raft"
+	"sort"
 	"sync"
 	"time"
 )
@@ -246,9 +247,6 @@ func (sm *ShardMaster) newConfig() *Config {
 // make a map from replica group id to the shards they handle.
 func (sm *ShardMaster) makeGidToShardsMap(config *Config) map[int][]int {
 	gidToShards := make(map[int][]int)
-	for gid := range config.Groups {
-		gidToShards[gid] = make([]int, 0)
-	}
 	for shard, gid := range config.Shards {
 		gidToShards[gid] = append(gidToShards[gid], shard)
 	}
@@ -259,16 +257,14 @@ func (sm *ShardMaster) makeGidSlice(conf *Config) (gids []int) {
 	for gid, _ := range conf.Groups {
 		gids = append(gids, gid)
 	}
+	sort.Ints(gids)
 	return
 }
 
-func (sm *ShardMaster) findGroupToMove(gidToShards map[int][]int) (groupWithMaxShards, maxShards, groupWithMinShards, minShards int) {
+func (sm *ShardMaster) findGroupToMove(gidToShards map[int][]int, gids []int) (groupWithMaxShards, maxShards, groupWithMinShards, minShards int) {
 	groupWithMaxShards, maxShards, groupWithMinShards, minShards = 0, 0, 0, 0
-	for gid, shards := range gidToShards {
-		if gid == 0 {
-			continue
-		}
-
+	for _, gid := range gids {
+		shards := gidToShards[gid]
 		if groupWithMaxShards == 0 || len(gidToShards[groupWithMaxShards]) < len(shards) {
 			groupWithMaxShards = gid
 			maxShards = len(shards)
@@ -304,7 +300,7 @@ func (sm *ShardMaster) reBalance(conf *Config) {
 	// each time move a shard from replica group with max shards to replica group with min shards.
 	// stop when max shards  == min shards +1
 	for {
-		groupWithMaxShards, maxShards, groupWithMinShards, minShards := sm.findGroupToMove(gidToShards)
+		groupWithMaxShards, maxShards, groupWithMinShards, minShards := sm.findGroupToMove(gidToShards, gids)
 		if maxShards-minShards <= 1 {
 			break
 		}
@@ -317,6 +313,7 @@ func (sm *ShardMaster) reBalance(conf *Config) {
 	}
 }
 
+// the new configuration caused by Join operation must be deterministic among all shard master replicas
 func (sm *ShardMaster) applyJoin(entry Op) {
 	if len(entry.Servers) == 0 {
 		return
@@ -332,6 +329,7 @@ func (sm *ShardMaster) applyJoin(entry Op) {
 	DPrintf("%d finish join req, latest conf %v", sm.me, *conf)
 }
 
+// the new configuration caused by Leave operation must be deterministic among all shard master replicas
 func (sm *ShardMaster) applyLeave(entry Op) {
 	if len(entry.GIDs) == 0 {
 		return
@@ -349,12 +347,14 @@ func (sm *ShardMaster) applyLeave(entry Op) {
 
 	sm.reBalance(conf)
 	sm.configs = append(sm.configs, *conf)
+	DPrintf("%d finish leave req, latest conf %v", sm.me, *conf)
 }
 
 func (sm *ShardMaster) applyMove(entry Op) {
 	conf := sm.newConfig()
 	conf.Shards[entry.Shard] = entry.GID
 	sm.configs = append(sm.configs, *conf)
+	DPrintf("%d finish move req, latest conf %v", sm.me, *conf)
 }
 
 // StartServer servers[] contains the ports of the set of
