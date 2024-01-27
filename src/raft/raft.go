@@ -444,6 +444,8 @@ func (rf *Raft) applyLog() {
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		rf.applyC <- ApplyMsg{CommandIndex: i, CommandValid: true, Command: rf.logs[i-baseIndex].Command}
 	}
+
+	DPrintf("%v applied log from %v to %v", rf.lastApplied, rf.commitIndex)
 	rf.lastApplied = rf.commitIndex // follower applied
 }
 
@@ -497,16 +499,17 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		if rf.logs[i-baseIndex].Term < rf.currentTerm {
 			break // do not commit logs of other term
 		}
-		count := 0
+
+		count := 1 // rf.matchIndex[leader] is always match
 		for peer, _ := range rf.peers {
-			if rf.matchIndex[peer] >= i {
+			if peer != rf.me && rf.matchIndex[peer] >= i {
 				count++
 			}
 		}
 
 		if count >= majority {
+			DPrintf("leader %d ,forward commitIndex from %v to  %dv matchIndex: %v", rf.me, rf.commitIndex, i, rf.matchIndex)
 			rf.commitIndex = i
-			DPrintf("leader %d ,forward commitIndex to  %d, matchIndex: %v", rf.me, rf.commitIndex, rf.matchIndex)
 			go rf.applyLog()
 			break
 		}
@@ -681,7 +684,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		// state has changed
 		rf.persist()
 
-		rf.matchIndex[rf.me] = index
+		//rf.matchIndex[rf.me] = index  // rf.matchIndex[leader] is always match
 		rf.nextIndex[rf.me] = index + 1
 		DPrintf("add log entry to leader %d ,current logs len : %d", rf.me, len(rf.logs))
 		// broadcastAppendEntries groutine will send to followers later
@@ -720,7 +723,7 @@ func (rf *Raft) Run() {
 			// then reset election timeout in next loop
 			case <-rf.heartBeatC:
 			case <-rf.grantVoteC:
-			case <-time.After(time.Millisecond * time.Duration(rand.Intn(200)+150)): // not receive any valid heartbeat or valid vote request , election timeout!!
+			case <-time.After(time.Millisecond * time.Duration(rand.Intn(160)+160)): // not receive any valid heartbeat or valid vote request , election timeout!!
 				DPrintf("%d become candidate, %p\n", rf.me, rf)
 				rf.mu.Lock()
 				rf.state = STATE_CANDIDATE
@@ -732,7 +735,7 @@ func (rf *Raft) Run() {
 
 			select {
 			case <-rf.discoverHigherTermC: // find a newer term ,convert to follower
-			case <-time.After(time.Millisecond * 100): // heartbeat timeout
+			case <-time.After(time.Millisecond * 80): // heartbeat timeout
 			}
 
 		case STATE_CANDIDATE:
@@ -751,7 +754,7 @@ func (rf *Raft) Run() {
 			case <-rf.discoverHigherTermC: // find a newer term ,convert to follower
 			case <-rf.heartBeatC: // receive appendEntries from a valid leader , become follower
 			case <-rf.winElectionC: // receive majority votes, become leader and broadcast append entries in next loop
-			case <-time.After(time.Millisecond * time.Duration(rand.Intn(200)+150)): // vote split, go to next election in next loop
+			case <-time.After(time.Millisecond * time.Duration(rand.Intn(160)+160)): // vote split, go to next election in next loop
 				rf.mu.Lock()
 				DPrintf("%d candidate vote split ,vote: %d\n", rf.me, rf.voteCount)
 				rf.mu.Unlock()
