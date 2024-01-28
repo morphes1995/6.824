@@ -1,6 +1,5 @@
 package shardkv
 
-// import "shardmaster"
 import (
 	"6.824/src/labgob"
 	"6.824/src/labrpc"
@@ -11,22 +10,24 @@ import (
 	"time"
 )
 
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+const (
+	RespondTimeout          = 600
+	ConfigureMonitorTimeout = 80
+)
 
-	ClientId  int64
-	RequestId int64
-	Command   string
-
-	Key   string
-	Value string
+type OperationContext struct {
+	LastRequestId       int64
+	LastResponse        CommandResponse
+	MaxAppliedCommandId int
 }
 
-type OpResult struct {
-	Op
-	Err Err
+func (c OperationContext) deepCopy() OperationContext {
+	ctx := OperationContext{
+		LastRequestId:       c.LastRequestId,
+		LastResponse:        c.LastResponse,
+		MaxAppliedCommandId: c.MaxAppliedCommandId,
+	}
+	return ctx
 }
 
 type ShardKV struct {
@@ -40,212 +41,196 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	stopCh                       chan any
-	stopReconfigureCh            chan any
-	data                         [shardmaster.NShards]map[string]string // each shard has a kv map
-	ack                          map[int64]int64
-	pendingRequests              map[int]chan OpResult
-	pendingConfigurationRequests map[int]chan ConfigurationOp
-	pendingCleanUpRequests       map[int]chan CleanUpOp
+	dead          int32
+	stateMachines map[int]*Shard // each shard data and state
+	//ack                          map[int64]int64
+	notifyChans map[int]chan CommandResponse // notify client goroutine by applier goroutine to response
 
-	config shardmaster.Config
-	mck    *shardmaster.Clerk
+	lastConfig    shardmaster.Config
+	currentConfig shardmaster.Config
+
+	mck *shardmaster.Clerk
+
+	lastOperations map[int64]OperationContext
+	lastApplied    int
 }
 
-func (kv *ShardKV) own(key string) bool {
-	return kv.config.Shards[key2shard(key)] == kv.gid
+// check whether this raft group can serve this shard at present
+// check before write raft log and before apply to SM
+func (kv *ShardKV) canServe(shardID int) bool {
+	return kv.currentConfig.Shards[shardID] == kv.gid &&
+		(kv.stateMachines[shardID].Status == Serving || kv.stateMachines[shardID].Status == GCing)
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	entry := Op{
+	op := &Op{
 		Command:   Get,
-		Key:       args.Key,
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
+		Key:       args.Key,
 	}
 
-	ok, err := kv.appendLogEntry(entry)
-	reply.WrongLeader = err == WrongLeader
-	reply.Err = err
-	if !ok {
+	// pre-check invalid operations
+	kv.mu.Lock()
+	// return ErrWrongGroup directly to let client fetch latest configuration and perform a retry if this key can't be served by this shard at present
+	if !kv.canServe(key2shard(args.Key)) {
+		reply.WrongLeader = false
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
 		return
 	}
-
-	kv.mu.Lock()
-	shard := key2shard(args.Key)
-	if value, exists := kv.data[shard][args.Key]; exists {
-		reply.Value = value
-		reply.Err = OK
-	} else {
-		reply.Err = ErrNoKey
-	}
-
 	kv.mu.Unlock()
+
+	err, value := kv.appendLogEntry(NewOperationCommand(op))
+	reply.WrongLeader = err == WrongLeader
+	reply.Err = err
+	reply.Value = value
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	entry := Op{
+	// pre-check invalid operations
+	kv.mu.Lock()
+	// return ErrWrongGroup directly to let client fetch latest configuration and perform a retry if this key can't be served by this shard at present
+	if !kv.canServe(key2shard(args.Key)) {
+		reply.WrongLeader = false
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+
+	if kv.isDuplicateRequest(args.ClientId, args.RequestId) {
+		DPrintf("request %d already processed", args.RequestId)
+		lastOperationCtx := kv.lastOperations[args.ClientId]
+		reply.Err = lastOperationCtx.LastResponse.Err
+		reply.WrongLeader = reply.Err == WrongLeader
+		kv.mu.Unlock()
+		return
+	}
+
+	kv.mu.Unlock()
+
+	op := &Op{
 		Command:   args.Op,
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 		Key:       args.Key,
 		Value:     args.Value,
 	}
-
-	_, err := kv.appendLogEntry(entry)
+	err, _ := kv.appendLogEntry(NewOperationCommand(op))
 	reply.WrongLeader = err == WrongLeader
 	reply.Err = err
+
+	//PrintDetail(kv, *op, err)
 }
 
-// check if the result corresponds to the log entry.
-func (kv *ShardKV) isMatch(entry1 Op, entry2 Op) bool {
-	return entry1.ClientId == entry2.ClientId && entry1.RequestId == entry2.RequestId
-}
-
-func (kv *ShardKV) appendLogEntry(entry Op) (bool, Err) {
-	// pre-check invalid operations
-	kv.mu.Lock()
-	if !kv.own(entry.Key) {
-		kv.mu.Unlock()
-		return false, ErrWrongGroup
-	}
-
-	requestId, ok := kv.ack[entry.ClientId]
-	if ok && requestId >= entry.RequestId { // ignore requests that already processed
-		kv.mu.Unlock()
-		DPrintf("request %d already processed", entry.RequestId)
-		return true, OK
-	}
-	kv.mu.Unlock()
-
+func (kv *ShardKV) appendLogEntry(command Command) (err Err, value string) {
 	// write raft log
-	index, _, isLeader := kv.rf.Start(entry)
+	index, _, isLeader := kv.rf.Start(command)
 	if !isLeader {
-		return false, WrongLeader
+		return WrongLeader, ""
 	}
 
 	kv.mu.Lock()
-	ch, ok := kv.pendingRequests[index]
-	if !ok {
-		ch = make(chan OpResult, 1)
-		kv.pendingRequests[index] = ch
-	}
+	ch := kv.getNotifyChan(index)
 	kv.mu.Unlock()
 
-	// wait for raft to commit and apply this op
-	//result, err := false, WrongLeader
-	var result bool
-	var err Err
 	select {
-	case entryApplied := <-ch:
-		// logs[index] may be changed and is not equal to `entry` , because the leadership change
-		// and old leader's log entry was overwritten by new leader's
-		if entryApplied.Op == entry && entryApplied.Err == OK {
-			result, err = true, OK
-		} else {
-			result, err = false, WrongLeader
-		}
-	case <-time.After(300 * time.Millisecond):
-		DPrintf("%v wait appendLogEntry timeout ", kv.myInfo())
-		result, err = false, WrongLeader
+	case res := <-ch:
+		err, value = res.Err, res.Value
+		DPrintf("%v-%v read from chan , res %v", kv.gid, kv.me, res)
+	case <-time.After(RespondTimeout * time.Millisecond):
+		err = WrongLeader
+		DPrintf("%v-%v read from chan timeout ", kv.gid, kv.me)
 	}
 
-	kv.mu.Lock()
-	delete(kv.pendingRequests, index) // remove stale chan
-	kv.mu.Unlock()
+	go kv.closeNotifyCh(index)
 
-	PrintDetail(kv, entry, result, err)
-	return result, err
+	return
 }
 
-func (kv *ShardKV) Run() {
-	for {
+func (kv *ShardKV) applier() {
+	for kv.killed() == false {
 		select {
-		// 0. receive applied log entry from raft
-		case msg := <-kv.applyCh:
-			kv.mu.Lock()
-			if msg.IsSnapshot {
-				// 1. apply snapshot
-				kv.applySnapshot(msg.Snapshot)
+		case message := <-kv.applyCh:
+			DPrintf("{Node %v}{Group %v} tries to apply message %v", kv.me, kv.gid, message)
+			if message.IsSnapshot {
+				kv.mu.Lock()
+				kv.restoreSnapshot(message.Snapshot)
+				kv.lastApplied = message.LastIncludedIndex
+				kv.mu.Unlock()
 			} else {
-				switch msg.Command.(type) {
-				case Op:
-					entry := msg.Command.(Op)
-					kv.applyNormalOperation(entry, msg.CommandIndex)
-				case ConfigurationOp:
-					entry := msg.Command.(ConfigurationOp)
-					kv.applyConfigurationChange(entry, msg.CommandIndex)
-				case CleanUpOp:
-					entry := msg.Command.(CleanUpOp)
-					kv.applyCleanup(entry, msg.CommandIndex)
+				kv.mu.Lock()
+				if message.CommandIndex <= kv.lastApplied {
+					DPrintf("{Node %v}{Group %v} discards outdated message %v because a newer snapshot which lastApplied is %v has been restored", kv.me, kv.gid, message, kv.lastApplied)
+					kv.mu.Unlock()
+					continue
+				}
+				kv.lastApplied = message.CommandIndex
+
+				var response CommandResponse
+				command := message.Command.(Command)
+				switch command.Op {
+				case Operation:
+					operation := command.Data.(Op)
+					response = kv.applyOperation(&message, &operation)
+				case Configuration:
+					nextConfig := command.Data.(shardmaster.Config)
+					response = kv.applyConfiguration(&nextConfig)
+				case InsertShards:
+					shardsInfo := command.Data.(ShardOperationResponse)
+					response = kv.applyInsertShards(&shardsInfo)
+				case DeleteShards:
+					shardsInfo := command.Data.(ShardOperationRequest)
+					response = kv.applyDeleteShards(&shardsInfo)
+				case EmptyEntry:
+					response = kv.applyEmptyEntry()
 				}
 
-				//  create snapshot if raft state exceeds allowed size
-				if kv.maxraftstate != -1 && kv.rf.GetStateSize() >= kv.maxraftstate {
-					w := new(bytes.Buffer)
-					e := labgob.NewEncoder(w)
-
-					e.Encode(kv.data)
-					e.Encode(kv.ack)
-					e.Encode(kv.config)
-					go kv.rf.CreateSnapShot(w.Bytes(), msg.CommandIndex)
+				// only notify related channel for currentTerm's log when node is leader
+				if currentTerm, isLeader := kv.rf.GetState(); isLeader && message.CommandTerm == currentTerm {
+					ch := kv.getNotifyChan(message.CommandIndex)
+					ch <- response
 				}
+
+				needSnapshot := kv.needSnapshot()
+				if needSnapshot {
+					kv.takeSnapshot(message.CommandIndex)
+				}
+				kv.mu.Unlock()
 			}
-			kv.mu.Unlock()
-
-		case <-kv.stopCh:
-			return
-
 		}
 	}
 }
 
-func (kv *ShardKV) applyNormalOperation(entry Op, commitIndex int) {
-	err := OK
-	if kv.own(entry.Key) {
-		requestId, ok := kv.ack[entry.ClientId]
-		if !ok || requestId < entry.RequestId {
-			// 2.1. apply state to kv server
-			kv.applyEntry(entry)
-			kv.ack[entry.ClientId] = entry.RequestId
-		}
-	} else {
-		err = ErrWrongGroup
-	}
-
-	// 2.2. notify pending operation
-	ch, ok := kv.pendingRequests[commitIndex]
-	if ok {
-		ch <- OpResult{Op: entry, Err: Err(err)}
-	}
-
+func (kv *ShardKV) needSnapshot() bool {
+	return kv.maxraftstate != -1 && kv.rf.GetStateSize() >= kv.maxraftstate
 }
 
-func (kv *ShardKV) applyEntry(entry Op) {
-	switch entry.Command {
-	case Get:
-		// do nothing
-	case Put:
-		kv.data[key2shard(entry.Key)][entry.Key] = entry.Value
-	case Append:
-		kv.data[key2shard(entry.Key)][entry.Key] += entry.Value
-	}
-	DPrintf("%s op %v,  apply to kv.data,   key %v, value  %v ,  value in kv.data %v ",
-		kv.myInfo(), entry.Command, entry.Key, entry.Value, kv.data[key2shard(entry.Key)])
+func (kv *ShardKV) takeSnapshot(commandIndex int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(kv.stateMachines)
+	e.Encode(kv.lastOperations)
+	e.Encode(kv.currentConfig)
+	e.Encode(kv.lastOperations)
+
+	go kv.rf.CreateSnapShot(w.Bytes(), commandIndex)
 }
 
-func (kv *ShardKV) applySnapshot(snapshot []byte) {
+func (kv *ShardKV) restoreSnapshot(snapshot []byte) {
 	var lastIncludedIndex, lastIncludedTerm int
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 
 	d.Decode(&lastIncludedIndex)
 	d.Decode(&lastIncludedTerm)
-	d.Decode(&kv.data)
-	d.Decode(&kv.ack)
-	d.Decode(&kv.config)
+	d.Decode(&kv.stateMachines)
+	d.Decode(&kv.lastOperations)
+	d.Decode(&kv.currentConfig)
+	d.Decode(&kv.lastOperations)
 }
 
 // Kill the tester calls Kill() when a ShardKV instance won't
@@ -255,8 +240,75 @@ func (kv *ShardKV) applySnapshot(snapshot []byte) {
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
-	kv.stopCh <- true
-	kv.stopReconfigureCh <- true
+	kv.mu.Lock()
+	kv.dead = 1
+	kv.mu.Unlock()
+}
+
+func (kv *ShardKV) killed() bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	return kv.dead == 1
+}
+
+func (kv *ShardKV) applyOperation(msg *raft.ApplyMsg, op *Op) CommandResponse {
+	var response CommandResponse
+	shardID := key2shard(op.Key)
+	if kv.canServe(shardID) {
+		if op.Command != Get && kv.isDuplicateRequest(op.ClientId, op.RequestId) {
+			DPrintf("{Node %v}{Group %v} doesn't apply duplicated message %v to stateMachine because maxAppliedCommandId is %v for client %v", kv.me, kv.gid, msg, kv.lastOperations[op.ClientId], op.ClientId)
+			return kv.lastOperations[op.ClientId].LastResponse
+		} else {
+			response = kv.applyLogToStateMachines(op, shardID)
+			if op.Command != Get {
+				kv.lastOperations[op.ClientId] = OperationContext{op.RequestId, response, msg.CommandIndex}
+			}
+			return response
+		}
+	}
+	return CommandResponse{ErrWrongGroup, ""}
+
+}
+
+func (kv *ShardKV) isDuplicateRequest(clientId, requestId int64) bool {
+	lastOperationCtx, ok := kv.lastOperations[clientId]
+	if ok {
+		return lastOperationCtx.LastRequestId >= requestId
+	}
+	return false
+}
+
+func (kv *ShardKV) applyLogToStateMachines(op *Op, shardId int) CommandResponse {
+	resp := CommandResponse{}
+	switch op.Command {
+	case Get:
+		resp.Value, resp.Err = kv.stateMachines[shardId].Get(op.Key)
+	case Put:
+		resp.Err = kv.stateMachines[shardId].Put(op.Key, op.Value)
+	case Append:
+		resp.Err = kv.stateMachines[shardId].Append(op.Key, op.Value)
+	}
+	DPrintf("%v-%v op %v,  apply to kv.data,   key %v, value  %v ,  value in kv.data %v ",
+		kv.gid, kv.me, op.Command, op.Key, op.Value, kv.stateMachines[key2shard(op.Key)])
+
+	return resp
+}
+
+func (kv *ShardKV) getNotifyChan(commandIndex int) chan CommandResponse {
+	if _, existCh := kv.notifyChans[commandIndex]; !existCh {
+		kv.notifyChans[commandIndex] = make(chan CommandResponse, 1)
+	}
+	return kv.notifyChans[commandIndex]
+}
+
+func (kv *ShardKV) closeNotifyCh(index int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if _, ok := kv.notifyChans[index]; ok {
+		close(kv.notifyChans[index])
+		delete(kv.notifyChans, index)
+	}
 }
 
 // StartServer servers[] contains the ports of the servers in this group.
@@ -290,35 +342,290 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 
-	kv := new(ShardKV)
-	kv.me = me
-	kv.maxraftstate = maxraftstate
-	kv.make_end = make_end
-	kv.gid = gid
-	kv.masters = masters
+	labgob.Register(Command{})
+	//labgob.Register(CommandRequest{})
+	labgob.Register(shardmaster.Config{})
+	labgob.Register(ShardOperationResponse{})
+	labgob.Register(ShardOperationRequest{})
 
-	// Your initialization code here.
-
-	// Use something like this to talk to the shardmaster:
-	// kv.mck = shardmaster.MakeClerk(kv.masters)
-
-	kv.mck = shardmaster.MakeClerk(masters)
-
-	for i := 0; i < shardmaster.NShards; i++ {
-		kv.data[i] = make(map[string]string)
+	applyCh := make(chan raft.ApplyMsg, 100)
+	kv := &ShardKV{
+		me:             me,
+		dead:           0,
+		rf:             raft.Make(servers, me, persister, applyCh),
+		applyCh:        applyCh,
+		make_end:       make_end,
+		gid:            gid,
+		masters:        masters,
+		mck:            shardmaster.MakeClerk(masters),
+		lastApplied:    0,
+		maxraftstate:   maxraftstate,
+		stateMachines:  make(map[int]*Shard),
+		currentConfig:  shardmaster.Config{},
+		lastConfig:     shardmaster.Config{},
+		lastOperations: make(map[int64]OperationContext),
+		notifyChans:    make(map[int]chan CommandResponse),
 	}
 
-	kv.stopCh = make(chan any, 1)
-	kv.stopReconfigureCh = make(chan any, 1)
-	kv.applyCh = make(chan raft.ApplyMsg, 100)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	for i := 0; i < shardmaster.NShards; i++ {
+		kv.stateMachines[i] = NewShard()
+	}
 
-	kv.ack = make(map[int64]int64)
-	kv.pendingRequests = make(map[int]chan OpResult)
+	kv.restoreSnapshot(persister.ReadSnapshot())
 
-	go kv.Run()
+	// Use something like this to talk to the shardmaster:
 
-	InitReconfiguration(kv)
+	// start applier goroutine to apply committed logs to stateMachine
+	go kv.applier()
+	// start configuration monitor goroutine to fetch latest configuration
+	go kv.Monitor(kv.configureAction, ConfigureMonitorTimeout*time.Millisecond)
+	// start migration monitor goroutine to pull related shards
+	go kv.Monitor(kv.migrationAction, ConfigureMonitorTimeout*time.Millisecond)
+	// start gc monitor goroutine to delete useless shards in remote groups
+	go kv.Monitor(kv.gcAction, ConfigureMonitorTimeout*time.Millisecond)
+
+	// start entry-in-currentTerm monitor goroutine to advance commitIndex by appending empty entries in current term periodically to avoid live locks
+	go kv.Monitor(kv.checkEntryInCurrentTermAction, 150*time.Millisecond)
 
 	return kv
+}
+
+func (kv *ShardKV) Monitor(action func(), timeout time.Duration) {
+	for kv.killed() == false {
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			action()
+		}
+
+		action()
+		time.Sleep(timeout)
+	}
+}
+
+func (kv *ShardKV) configureAction() {
+	canPerformNextConfig := true
+	kv.mu.Lock()
+	for shardId, shard := range kv.stateMachines {
+		if shard.Status != Serving {
+			canPerformNextConfig = false
+			DPrintf("{Node %v}{Group %v} will not try to fetch latest configuration because shard %v's status is %v when currentConfig is %v",
+				kv.me, kv.gid, shardId, shard.Status, kv.currentConfig)
+			break
+		}
+	}
+	currentConfigNum := kv.currentConfig.Num
+	kv.mu.Unlock()
+
+	if canPerformNextConfig {
+		nextConfig := kv.mck.Query(currentConfigNum + 1)
+		if nextConfig.Num == currentConfigNum+1 {
+			DPrintf("{Node %v}{Group %v} fetches latest configuration %v when currentConfigNum is %v",
+				kv.me, kv.gid, nextConfig, currentConfigNum)
+			kv.appendLogEntry(NewConfigurationCommand(&nextConfig))
+		}
+	}
+}
+
+func (kv *ShardKV) applyConfiguration(nextConfig *shardmaster.Config) CommandResponse {
+	if nextConfig.Num == kv.currentConfig.Num+1 {
+		DPrintf("{Node %v}{Group %v} updates currentConfig from %v to %v", kv.me, kv.gid, kv.currentConfig, nextConfig)
+		kv.updateShardStatus(nextConfig)
+		kv.lastConfig = kv.currentConfig
+		kv.currentConfig = *nextConfig
+		return CommandResponse{OK, ""}
+	}
+	DPrintf("{Node %v}{Group %v} not ready, rejects config %v when currentConfig is %v",
+		kv.me, kv.gid, nextConfig, kv.currentConfig)
+	return CommandResponse{ErrNotReady, ""}
+}
+
+func (kv *ShardKV) updateShardStatus(nextConfig *shardmaster.Config) {
+	for shardId, gid := range nextConfig.Shards {
+		// 如果之前没有该shard，新配置里又有了，则将该shard状态设为等待从前任所有者迁移shard过来
+		if kv.currentConfig.Shards[shardId] != kv.gid && gid == kv.gid {
+			if nextConfig.Num == 1 { // 代表刚初始化集群，不需要去其他group获取shard，直接设为Exist
+				kv.stateMachines[shardId].Status = Serving
+			} else {
+				kv.stateMachines[shardId].Status = Pulling
+			}
+		}
+
+		// 如果曾经拥有该shard但新配置里没有了，则将该shard状态设为等待迁移走
+		if kv.currentConfig.Shards[shardId] == kv.gid && gid != kv.gid {
+			kv.stateMachines[shardId].Status = BePulling
+		}
+		// 之前有现在也有，之前没有现在也没有的情况均不需要迁移shard
+	}
+}
+
+func (kv *ShardKV) migrationAction() {
+	kv.mu.Lock()
+	gid2shardIDs := kv.getShardIDsByStatus(Pulling)
+	var wg sync.WaitGroup
+	for gid, shardIDs := range gid2shardIDs {
+		DPrintf("{Node %v}{Group %v} starts a PullTask to get shards %v from group %v when config is %v", kv.me, kv.gid, shardIDs, gid, kv.currentConfig)
+		wg.Add(1)
+		go func(servers []string, configNum int, shardIDs []int) {
+			defer wg.Done()
+			pullTaskRequest := ShardOperationRequest{configNum, shardIDs}
+			for _, server := range servers {
+				var pullTaskResponse ShardOperationResponse
+				srv := kv.make_end(server)
+				if srv.Call("ShardKV.GetShardsData", &pullTaskRequest, &pullTaskResponse) && pullTaskResponse.Err == OK {
+					DPrintf("{Node %v}{Group %v} gets a PullTaskResponse %v and tries to commit it when currentConfigNum is %v",
+						kv.me, kv.gid, pullTaskResponse, configNum)
+
+					kv.appendLogEntry(NewInsertShardsCommand(&pullTaskResponse))
+				}
+			}
+		}(kv.lastConfig.Groups[gid], kv.currentConfig.Num, shardIDs)
+	}
+
+	kv.mu.Unlock()
+	wg.Wait()
+}
+
+func (kv *ShardKV) GetShardsData(request *ShardOperationRequest, response *ShardOperationResponse) {
+	// only pull shards from leader
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		response.Err = WrongLeader
+		return
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	defer DPrintf("{Node %v}{Group %v} processes PullTaskRequest %v with response %v", kv.me, kv.gid, request, response)
+
+	if kv.currentConfig.Num < request.ConfigNum {
+		response.Err = ErrNotReady
+		return
+	}
+
+	response.Shards = make(map[int]map[string]string)
+	for _, shardID := range request.ShardIDs {
+		response.Shards[shardID] = kv.stateMachines[shardID].deepCopy()
+	}
+
+	response.LastOperations = make(map[int64]OperationContext)
+	for clientID, operation := range kv.lastOperations {
+		response.LastOperations[clientID] = operation.deepCopy()
+	}
+
+	response.ConfigNum, response.Err = request.ConfigNum, OK
+}
+
+func (kv *ShardKV) applyInsertShards(shardsInfo *ShardOperationResponse) CommandResponse {
+	if shardsInfo.ConfigNum == kv.currentConfig.Num {
+		DPrintf("{Node %v}{Group %v} accepts shards insertion %v when currentConfig is %v", kv.me, kv.gid, shardsInfo, kv.currentConfig)
+		for shardId, shardData := range shardsInfo.Shards {
+			shard := kv.stateMachines[shardId]
+			if shard.Status == Pulling {
+				for key, value := range shardData {
+					shard.KV[key] = value
+				}
+				shard.Status = GCing
+			} else {
+				DPrintf("{Node %v}{Group %v} encounters duplicated shards insertion %v when currentConfig is %v",
+					kv.me, kv.gid, shardsInfo, kv.currentConfig)
+				break
+			}
+		}
+		for clientId, operationContext := range shardsInfo.LastOperations {
+			if lastOperation, ok := kv.lastOperations[clientId]; !ok || lastOperation.MaxAppliedCommandId < operationContext.MaxAppliedCommandId {
+				kv.lastOperations[clientId] = operationContext
+			}
+		}
+		return CommandResponse{OK, ""}
+	}
+	DPrintf("{Node %v}{Group %v} rejects outdated shards insertion %v when currentConfig is %v", kv.me, kv.gid, shardsInfo, kv.currentConfig)
+	return CommandResponse{ErrNotReady, ""}
+}
+
+func (kv *ShardKV) getShardIDsByStatus(status ShardStatus) (gid2shardIDs map[int][]int) {
+	gid2shardIDs = make(map[int][]int)
+	for shardId, shard := range kv.stateMachines {
+		if shard.Status == status {
+			gid := kv.lastConfig.Shards[shardId]
+			gid2shardIDs[gid] = append(gid2shardIDs[gid], shardId)
+		}
+	}
+	return
+}
+
+func (kv *ShardKV) gcAction() {
+	kv.mu.Lock()
+	gid2shardIDs := kv.getShardIDsByStatus(GCing)
+	var wg sync.WaitGroup
+	for gid, shardIDs := range gid2shardIDs {
+		DPrintf("{Node %v}{Group %v} starts a GCTask to delete shards %v in group %v when config is %v", kv.me, kv.gid, shardIDs, gid, kv.currentConfig)
+		wg.Add(1)
+		go func(servers []string, configNum int, shardIDs []int) {
+			defer wg.Done()
+			gcTaskRequest := ShardOperationRequest{configNum, shardIDs}
+			for _, server := range servers {
+				var gcTaskResponse ShardOperationResponse
+				srv := kv.make_end(server)
+				if srv.Call("ShardKV.DeleteShardsData", &gcTaskRequest, &gcTaskResponse) && gcTaskResponse.Err == OK {
+					DPrintf("{Node %v}{Group %v} deletes shards %v in remote group successfully when currentConfigNum is %v", kv.me, kv.gid, shardIDs, configNum)
+					kv.appendLogEntry(NewDeleteShardsCommand(&gcTaskRequest)) // update shard status from GCing to Serving
+				}
+			}
+		}(kv.lastConfig.Groups[gid], kv.currentConfig.Num, shardIDs)
+	}
+	kv.mu.Unlock()
+	wg.Wait()
+}
+
+func (kv *ShardKV) DeleteShardsData(request *ShardOperationRequest, response *ShardOperationResponse) {
+	// only delete shards when role is leader
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		response.Err = WrongLeader
+		return
+	}
+
+	defer DPrintf("{Node %v}{Group %v} processes GCTaskRequest %v with response %v", kv.me, kv.gid, request, response)
+
+	kv.mu.Lock()
+	if kv.currentConfig.Num > request.ConfigNum {
+		DPrintf("{Node %v}{Group %v}'s encounters duplicated shards deletion %v when currentConfig is %v", kv.me, kv.gid, request, kv.currentConfig)
+		response.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	err, _ := kv.appendLogEntry(NewDeleteShardsCommand(request)) // update shard status from BePulling to Serving
+	response.Err = err
+}
+
+func (kv *ShardKV) applyDeleteShards(shardsInfo *ShardOperationRequest) CommandResponse {
+	if shardsInfo.ConfigNum == kv.currentConfig.Num {
+		DPrintf("{Node %v}{Group %v}'s shards status are %v before accepting shards deletion %v when currentConfig is %v",
+			kv.me, kv.gid, kv.stateMachines, shardsInfo, kv.currentConfig)
+		for _, shardId := range shardsInfo.ShardIDs {
+			shard := kv.stateMachines[shardId]
+			if shard.Status == GCing {
+				shard.Status = Serving
+			} else if shard.Status == BePulling {
+				kv.stateMachines[shardId] = NewShard()
+			} else {
+				DPrintf("{Node %v}{Group %v} encounters duplicated shards deletion %v when currentConfig is %v", kv.me, kv.gid, shardsInfo, kv.currentConfig)
+				break
+			}
+		}
+		DPrintf("{Node %v}{Group %v}'s shards status are %v after accepting shards deletion %v when currentConfig is %v",
+			kv.me, kv.gid, kv.stateMachines, shardsInfo, kv.currentConfig)
+		return CommandResponse{OK, ""}
+	}
+	// 仅可执行与当前配置版本相同地分片删除日志，否则已经删除过，直接返回 OK 即可。
+	DPrintf("{Node %v}{Group %v}'s encounters duplicated shards deletion %v when currentConfig is %v", kv.me, kv.gid, shardsInfo, kv.currentConfig)
+	return CommandResponse{OK, ""}
+}
+
+func (kv *ShardKV) checkEntryInCurrentTermAction() {
+	if !kv.rf.HasLogInCurrentTerm() {
+		kv.appendLogEntry(NewEmptyEntryCommand())
+	}
+}
+
+func (kv *ShardKV) applyEmptyEntry() CommandResponse {
+	return CommandResponse{OK, ""}
 }

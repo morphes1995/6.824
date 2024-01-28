@@ -728,12 +728,6 @@ func TestChallenge1Delete(t *testing.T) {
 	fmt.Printf("  ... Passed\n")
 }
 
-func TestChallenge1Concurrent20(t *testing.T) {
-	for i := 0; i < 10; i++ {
-		TestChallenge1Concurrent(t)
-	}
-}
-
 func TestChallenge1Concurrent(t *testing.T) {
 	fmt.Printf("Test: concurrent configuration change and restart (challenge 1)...\n")
 
@@ -873,7 +867,7 @@ func TestChallenge2Unaffected(t *testing.T) {
 // optional test to see whether servers can handle operations on shards that
 // have been received as a part of a config migration when the entire migration
 // has not yet completed.
-func estChallenge2Partial(t *testing.T) {
+func TestChallenge2Partial(t *testing.T) {
 	fmt.Printf("Test: partial migration shard access (challenge 2) ...\n")
 
 	cfg := make_config(t, 3, true, 100)

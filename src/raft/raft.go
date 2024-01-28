@@ -42,9 +42,12 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
-	IsSnapshot bool
-	Snapshot   []byte
+	IsSnapshot        bool
+	Snapshot          []byte
+	LastIncludedIndex int
+	LastIncludedTerm  int
 }
 
 // LogEntry each entry contains command for state machine,
@@ -442,7 +445,7 @@ func (rf *Raft) applyLog() {
 	}
 
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		rf.applyC <- ApplyMsg{CommandIndex: i, CommandValid: true, Command: rf.logs[i-baseIndex].Command}
+		rf.applyC <- ApplyMsg{CommandIndex: i, CommandTerm: rf.currentTerm, CommandValid: true, Command: rf.logs[i-baseIndex].Command}
 	}
 
 	DPrintf("%v applied log from %v to %v", rf.lastApplied, rf.commitIndex)
@@ -821,8 +824,25 @@ func (rf *Raft) recoverFromSnapshot(snapshot []byte) {
 	rf.commitIndex = lastIncludedIndex
 	rf.trimLog(lastIncludedIndex, lastIncludedTerm)
 
-	msg := ApplyMsg{IsSnapshot: true, Snapshot: snapshot}
+	msg := ApplyMsg{IsSnapshot: true, Snapshot: snapshot, LastIncludedIndex: lastIncludedIndex, LastIncludedTerm: lastIncludedTerm}
 	rf.applyC <- msg // notify application to deal with snapshot msg
+}
+
+func (rf *Raft) HasLogInCurrentTerm() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for i := len(rf.logs) - 1; i >= 0; i-- {
+		if rf.logs[i].Term == rf.currentTerm {
+			return true
+		}
+
+		if rf.logs[i].Term < rf.currentTerm {
+			return false
+		}
+	}
+
+	return false
 }
 
 // Make

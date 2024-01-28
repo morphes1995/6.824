@@ -2,6 +2,7 @@ package shardkv
 
 import (
 	"6.824/src/shardmaster"
+	"fmt"
 	"log"
 )
 
@@ -61,11 +62,11 @@ type GetReply struct {
 	Value       string
 }
 
-type Configuration struct {
-	Config shardmaster.Config
-	Data   [shardmaster.NShards]map[string]string
-	Ack    map[int64]int64
-}
+//type Configuration struct {
+//	Config shardmaster.Config
+//	Data   [shardmaster.NShards]map[string]string
+//	Ack    map[int64]int64
+//}
 
 type MoveShardArgs struct {
 	Num      int
@@ -95,14 +96,86 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-func PrintDetail(kv *ShardKV, entry Op, result bool, err Err) {
-	switch entry.Command {
-	case Get:
-		DPrintf("%s, finish appendLogEntry ,op %v,  result %v , key %v, err %v , shardId %v, shard %v, conf %v %v",
-			kv.myInfo(), entry.Command, result, entry.Key, err, key2shard(entry.Key), kv.data[key2shard(entry.Key)], kv.config.Num, kv.config.Shards)
-	case Append, Put:
-		DPrintf("%s, finish appendLogEntry ,op %v,  result %v , key %v, value %v,  err %v ,shardId %v, shard %v,  conf %v %v",
-			kv.myInfo(), entry.Command, result, entry.Key, entry.Value, err, key2shard(entry.Key), kv.data[key2shard(entry.Key)], kv.config.Num, kv.config.Shards)
-	}
+func PrintDetail(kv *ShardKV, entry Op, err Err) {
+	DPrintf("%v-%v, finish appendLogEntry ,op %v , key %v, err %v , shardId %v, shard %v, conf %v %v",
+		kv.gid, kv.me, entry.Command, entry.Key, err, key2shard(entry.Key), kv.stateMachines[key2shard(entry.Key)], kv.currentConfig.Num, kv.currentConfig.Shards)
 
+}
+
+type CommandType uint8
+
+const (
+	Operation CommandType = iota
+	Configuration
+	InsertShards
+	DeleteShards
+	EmptyEntry
+)
+
+type Command struct {
+	Op   CommandType
+	Data interface{}
+}
+
+func (command Command) String() string {
+	return fmt.Sprintf("{Type:%v,Data:%v}", command.Op, command.Data)
+}
+
+func NewOperationCommand(op *Op) Command {
+	return Command{Operation, *op}
+}
+
+func NewConfigurationCommand(config *shardmaster.Config) Command {
+	return Command{Configuration, *config}
+}
+
+func NewInsertShardsCommand(response *ShardOperationResponse) Command {
+	return Command{InsertShards, *response}
+}
+
+func NewDeleteShardsCommand(request *ShardOperationRequest) Command {
+	return Command{DeleteShards, *request}
+}
+
+func NewEmptyEntryCommand() Command {
+	return Command{EmptyEntry, nil}
+}
+
+//type CommandRequest struct {
+//	//Servers   map[int][]string // for Join
+//	//GIDs      []int            // for Leave
+//	//Shard     int              // for Move
+//	//GID       int              // for Move
+//	//Num       int              // for Query
+//	Op        Op
+//	ClientId  int64
+//	CommandId int64
+//}
+
+type Op struct {
+	// Your definitions here.
+	// Field names must start with capital letters,
+	// otherwise RPC will break.
+
+	ClientId  int64
+	RequestId int64
+	Command   string
+
+	Key   string
+	Value string
+}
+
+type CommandResponse struct {
+	Err   Err
+	Value string
+}
+type ShardOperationRequest struct {
+	ConfigNum int
+	ShardIDs  []int
+}
+type ShardOperationResponse struct {
+	Err            Err
+	Shards         map[int]map[string]string
+	ConfigNum      int
+	LastOperations map[int64]OperationContext
 }
