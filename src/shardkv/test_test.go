@@ -728,6 +728,12 @@ func TestChallenge1Delete(t *testing.T) {
 	fmt.Printf("  ... Passed\n")
 }
 
+func TestChallenge1Concurrent20(t *testing.T) {
+	for i := 0; i < 10; i++ {
+		TestChallenge1Concurrent(t)
+	}
+}
+
 func TestChallenge1Concurrent(t *testing.T) {
 	fmt.Printf("Test: concurrent configuration change and restart (challenge 1)...\n")
 

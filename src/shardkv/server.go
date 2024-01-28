@@ -145,10 +145,10 @@ func (kv *ShardKV) appendLogEntry(entry Op) (bool, Err) {
 		if entryApplied.Op == entry && entryApplied.Err == OK {
 			result, err = true, OK
 		} else {
-			result, err = false, entryApplied.Err
+			result, err = false, WrongLeader
 		}
 	case <-time.After(300 * time.Millisecond):
-		DPrintf("%v wait appendLogEntry timeout ", kv.me)
+		DPrintf("%v wait appendLogEntry timeout ", kv.myInfo())
 		result, err = false, WrongLeader
 	}
 
@@ -232,6 +232,8 @@ func (kv *ShardKV) applyEntry(entry Op) {
 	case Append:
 		kv.data[key2shard(entry.Key)][entry.Key] += entry.Value
 	}
+	DPrintf("%s op %v,  apply to kv.data,   key %v, value  %v ,  value in kv.data %v ",
+		kv.myInfo(), entry.Command, entry.Key, entry.Value, kv.data[key2shard(entry.Key)])
 }
 
 func (kv *ShardKV) applySnapshot(snapshot []byte) {
