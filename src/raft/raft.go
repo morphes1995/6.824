@@ -445,10 +445,12 @@ func (rf *Raft) applyLog() {
 	}
 
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		rf.applyC <- ApplyMsg{CommandIndex: i, CommandTerm: rf.currentTerm, CommandValid: true, Command: rf.logs[i-baseIndex].Command}
+		DPrintf("me %v , apply log , idx %v, term %v , command %v",
+			rf.me, i, rf.logs[i-baseIndex].Term, rf.logs[i-baseIndex].Command)
+		rf.applyC <- ApplyMsg{CommandIndex: i, CommandTerm: rf.logs[i-baseIndex].Term, CommandValid: true, Command: rf.logs[i-baseIndex].Command}
 	}
 
-	DPrintf("%v applied log from %v to %v", rf.lastApplied, rf.commitIndex)
+	DPrintf("%v applied log from %v to %v", rf.me, rf.lastApplied, rf.commitIndex)
 	rf.lastApplied = rf.commitIndex // follower applied
 }
 
@@ -568,7 +570,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.lastApplied = args.LastIncludedIndex
 		rf.commitIndex = args.LastIncludedIndex
 
-		rf.applyC <- ApplyMsg{IsSnapshot: true, Snapshot: args.Data}
+		rf.applyC <- ApplyMsg{IsSnapshot: true, Snapshot: args.Data, LastIncludedIndex: args.LastIncludedIndex, LastIncludedTerm: args.LastIncludedTerm}
 	}
 }
 
@@ -832,14 +834,9 @@ func (rf *Raft) HasLogInCurrentTerm() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	for i := len(rf.logs) - 1; i >= 0; i-- {
-		if rf.logs[i].Term == rf.currentTerm {
-			return true
-		}
-
-		if rf.logs[i].Term < rf.currentTerm {
-			return false
-		}
+	latestLog := rf.logs[len(rf.logs)-1]
+	if rf.currentTerm == latestLog.Term {
+		return true
 	}
 
 	return false

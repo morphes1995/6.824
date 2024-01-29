@@ -62,44 +62,13 @@ type GetReply struct {
 	Value       string
 }
 
-//type Configuration struct {
-//	Config shardmaster.Config
-//	Data   [shardmaster.NShards]map[string]string
-//	Ack    map[int64]int64
-//}
-
-type MoveShardArgs struct {
-	Num      int
-	ShardIds []int
-}
-
-type MoveShardReply struct {
-	Err  Err
-	Data [shardmaster.NShards]map[string]string
-	Ack  map[int64]int64
-}
-
-func CopyMap(m map[string]string) (copied map[string]string) {
-	copied = make(map[string]string)
-	for k, v := range m {
-		copied[k] = v
-	}
-	return
-}
-
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
 		log.Printf("[shardkv]--"+format, a...)
 	}
 	return
-}
-
-func PrintDetail(kv *ShardKV, entry Op, err Err) {
-	DPrintf("%v-%v, finish appendLogEntry ,op %v , key %v, err %v , shardId %v, shard %v, conf %v %v",
-		kv.gid, kv.me, entry.Command, entry.Key, err, key2shard(entry.Key), kv.stateMachines[key2shard(entry.Key)], kv.currentConfig.Num, kv.currentConfig.Shards)
-
 }
 
 type CommandType uint8
@@ -141,17 +110,6 @@ func NewEmptyEntryCommand() Command {
 	return Command{EmptyEntry, nil}
 }
 
-//type CommandRequest struct {
-//	//Servers   map[int][]string // for Join
-//	//GIDs      []int            // for Leave
-//	//Shard     int              // for Move
-//	//GID       int              // for Move
-//	//Num       int              // for Query
-//	Op        Op
-//	ClientId  int64
-//	CommandId int64
-//}
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
@@ -178,4 +136,17 @@ type ShardOperationResponse struct {
 	Shards         map[int]map[string]string
 	ConfigNum      int
 	LastOperations map[int64]OperationContext
+}
+
+type OperationContext struct {
+	LastRequestId int64
+	LastResponse  CommandResponse
+}
+
+func (c OperationContext) deepCopy() OperationContext {
+	ctx := OperationContext{
+		LastRequestId: c.LastRequestId,
+		LastResponse:  c.LastResponse,
+	}
+	return ctx
 }
